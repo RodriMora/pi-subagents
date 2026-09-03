@@ -1,5 +1,5 @@
 {
-  "name": "pi-recursive-subagents",
+  "name": "pi-subagents",
   "version": "0.1.0",
   "description": "Recursive, isolated, asynchronous subagents for Pi",
   "keywords": ["pi-package", "pi", "pi-extension", "subagents", "agents"],

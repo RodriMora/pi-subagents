@@ -22,13 +22,13 @@ Recursive, isolated, asynchronous subagents for the [Pi coding agent](https://gi
 Install from npm with Pi:
 
 ```sh
-pi install npm:pi-recursive-subagents
+pi install npm:pi-subagents
 ```
 
 Restart Pi or run `/reload` after installing. To install the latest published version explicitly:
 
 ```sh
-pi update npm:pi-recursive-subagents
+pi update npm:pi-subagents
 ```
 
 For local development, the git install still works:
@@ -158,7 +158,7 @@ Source files are organized by responsibility:
 
 ## Publishing
 
-This repository is ready to publish as `pi-recursive-subagents`:
+This repository is ready to publish as `pi-subagents`:
 
 ```sh
 npm login
@@ -170,10 +170,10 @@ npm publish
 After publishing, verify the package from a clean Pi installation:
 
 ```sh
-pi install npm:pi-recursive-subagents
+pi install npm:pi-subagents
 ```
 
-For a later release, bump the version (for example with `npm version patch`), push the commit and tag, then run `npm publish` again. The package name `pi-subagents` is already taken on npm, so this package uses `pi-recursive-subagents`.
+For a later release, bump the version (for example with `npm version patch`), push the commit and tag, then run `npm publish` again.
 
 ## License
 
