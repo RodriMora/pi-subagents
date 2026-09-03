@@ -1,16 +1,29 @@
 {
   "name": "pi-subagents",
-  "version": "0.1.0",
+  "version": "0.65.0",
   "description": "Recursive, isolated, asynchronous subagents for Pi",
-  "keywords": ["pi-package", "pi", "pi-extension", "subagents", "agents"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "subagents",
+    "agents"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/williamcr01/pi-subagents.git"
   },
-  "files": ["*.ts", "assets", "README.md", "LICENSE"],
+  "files": [
+    "*.ts",
+    "assets",
+    "README.md",
+    "LICENSE"
+  ],
   "pi": {
-    "extensions": ["./index.ts"],
+    "extensions": [
+      "./index.ts"
+    ],
     "image": "https://raw.githubusercontent.com/williamcr01/pi-subagents/main/assets/pi-subagents-demo.png"
   },
   "peerDependencies": {
