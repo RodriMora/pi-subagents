@@ -4,6 +4,8 @@ Recursive, isolated, asynchronous subagents for the [Pi coding agent](https://gi
 
 `pi-subagents` adds background delegation to Pi without external npm dependencies. Spawn several focused agents in parallel, let agents recursively delegate their own work, monitor the live tree in Pi's footer, inspect real child transcripts, and collect results when they finish.
 
+![pi-subagents running recursive background agents](assets/pi-subagents-demo.png)
+
 ## Features
 
 - **Asynchronous spawning** — `spawn_agent` returns immediately while the child runs in its own Pi process and session.
@@ -17,14 +19,44 @@ Recursive, isolated, asynchronous subagents for the [Pi coding agent](https://gi
 
 ## Install
 
-Pi discovers extensions from `~/.pi/agent/extensions`. Clone this repository into that directory:
+Install from npm with Pi:
 
 ```sh
-mkdir -p ~/.pi/agent/extensions
-git clone https://github.com/williamcr01/pi-subagents.git ~/.pi/agent/extensions/subagents
+pi install npm:pi-recursive-subagents
 ```
 
-Restart Pi or run `/reload` after installing.
+Restart Pi or run `/reload` after installing. To install the latest published version explicitly:
+
+```sh
+pi update npm:pi-recursive-subagents
+```
+
+For local development, the git install still works:
+
+```sh
+pi install git:github.com/williamcr01/pi-subagents.git
+```
+
+## Usage
+
+Once installed, Pi automatically loads the extension. Ask Pi to delegate work, or use the tools directly:
+
+```text
+spawn_agent({
+  task: "Inspect the authentication flow and report security risks",
+  name: "auth-reviewer",
+  cwd: ".",
+  tools: ["read", "grep"]
+})
+```
+
+Use `check_subagents` to inspect progress or wait for results:
+
+```text
+check_subagents({ wait: true, timeoutMs: 120000 })
+```
+
+Use `cancel_subagent` with a run ID, session ID, or exact name to stop a child. In TUI mode, press **Down** at the bottom of the editor to open the live subagent panel; use `/subagents` to review finished agents and transcripts.
 
 ## Tools
 
@@ -123,6 +155,25 @@ Source files are organized by responsibility:
 - `events.ts` — child JSON event parsing and status updates
 - `panel.ts` — footer tree, selection, and transcript detail view
 - `transcript.ts` — rendering child session files
+
+## Publishing
+
+This repository is ready to publish as `pi-recursive-subagents`:
+
+```sh
+npm login
+node subagents.test.cjs
+npm pack --dry-run
+npm publish
+```
+
+After publishing, verify the package from a clean Pi installation:
+
+```sh
+pi install npm:pi-recursive-subagents
+```
+
+For a later release, bump the version (for example with `npm version patch`), push the commit and tag, then run `npm publish` again. The package name `pi-subagents` is already taken on npm, so this package uses `pi-recursive-subagents`.
 
 ## License
 
