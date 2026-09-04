@@ -310,7 +310,7 @@ async function runSubagentProcess(
 	};
 
 	try {
-		release = await gate.acquire(context.settings.maxConcurrency);
+		release = await gate.acquire(context.settings.maxConcurrency, context.signal);
 		if (record.status === "cancelled" || diskCancelled()) return;
 
 		const systemPrompt = `You are subagent "${record.name}" at depth ${record.depth}/${record.maxDepth}. Complete delegated tasks and return concise, self-contained results.`;

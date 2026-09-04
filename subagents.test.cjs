@@ -603,6 +603,28 @@ function check(name, cond, extra) {
 	}
 	check("queued child receives startup steering", polled?.status === "completed" && polled.latestText === "steered: queued steer", polled && `${polled.status} ${polled.latestText}`);
 
+	const heldForAbort = await spawn.gate.acquire(1);
+	const abortQueuedCtl = new AbortController();
+	const abortQueued = await spawn.startSubagent(
+		{ task: "must not launch", name: "abort-queued" },
+		{ ...baseCtx(), settings: { maxDepth: 2, maxConcurrency: 1 }, signal: abortQueuedCtl.signal },
+	);
+	check("abort target starts queued", abortQueued.status === "queued", abortQueued.status);
+	abortQueuedCtl.abort();
+	await new Promise((r) => setTimeout(r, 20));
+	heldForAbort();
+	let abortQueuedFinal;
+	for (let i = 0; i < 50; i++) {
+		abortQueuedFinal = registry.readRecords(spawnAgentDir).find((r) => r.runId === abortQueued.runId);
+		if (abortQueuedFinal && ["failed", "cancelled"].includes(abortQueuedFinal.status)) break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	check(
+		"queued spawn abort does not launch a child",
+		abortQueuedFinal?.pid === undefined && !abortQueuedFinal?.latestText && String(abortQueuedFinal?.error || "").includes("aborted"),
+		JSON.stringify(abortQueuedFinal),
+	);
+
 	// --- cancel race: a cancelled child must stay cancelled, not flip to failed ---
 	process.env.FAKE_DELAY_MS = "4000";
 	const raceRec = await spawn.startSubagent({ task: "race", name: "racer" }, baseCtx());
