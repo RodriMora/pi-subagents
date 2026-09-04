@@ -77,6 +77,14 @@ function check(name, cond, extra) {
 		try { config.loadSettings({ agentDir, cwd: sandbox, projectTrusted: false, env: {} }); } catch { threw = true; }
 		check(`invalid ${label} throws`, threw);
 	}
+	fs.writeFileSync(path.join(agentDir, "subagents.json"), "{}");
+	let envThinkingThrew = false;
+	try {
+		config.loadSettings({ agentDir, cwd: sandbox, projectTrusted: false, env: { PI_SUBAGENT_DEFAULT_THINKING: "ultra" } });
+	} catch {
+		envThinkingThrew = true;
+	}
+	check("invalid environment thinking throws", envThinkingThrew);
 
 	// --- registry ---
 	const agentDir2 = path.join(sandbox, "agent2");
@@ -224,6 +232,51 @@ function check(name, cond, extra) {
 		if (previousRootId === undefined) delete process.env.PI_SUBAGENT_ROOT_ID;
 		else process.env.PI_SUBAGENT_ROOT_ID = previousRootId;
 	}
+
+	// --- editor composition ---
+	const editorHandlers = new Map();
+	let installedEditorFactory;
+	let delegatedInput;
+	const existingEditor = {
+		render: () => [],
+		invalidate: () => {},
+		getText: () => "",
+		setText: () => {},
+		handleInput: (data) => { delegatedInput = data; },
+		isShowingAutocomplete: () => false,
+		getCursor: () => ({ line: 0, col: 0 }),
+		getLines: () => [""],
+	};
+	const originalEditorFactory = () => existingEditor;
+	let currentEditorFactory = originalEditorFactory;
+	const editorUi = {
+		setWidget: () => {},
+		getEditorComponent: () => currentEditorFactory,
+		setEditorComponent: (factory) => {
+			currentEditorFactory = factory;
+			if (factory !== originalEditorFactory) installedEditorFactory = factory;
+		},
+		notify: () => {},
+	};
+	const editorPi = {
+		...checkPi,
+		on: (event, handler) => editorHandlers.set(event, handler),
+	};
+	subagentsExtension(editorPi);
+	editorHandlers.get("session_start")({}, {
+		sessionManager: { getSessionId: () => "editor-parent" },
+		cwd: sandbox,
+		isProjectTrusted: () => false,
+		mode: "tui",
+		hasUI: true,
+		model: undefined,
+		ui: editorUi,
+	});
+	const composedEditor = installedEditorFactory({}, {}, { matches: () => false });
+	composedEditor.handleInput("z");
+	check("existing custom editor is composed instead of replaced", composedEditor === existingEditor && delegatedInput === "z");
+	editorHandlers.get("session_shutdown")?.({}, { mode: "tui", ui: editorUi });
+	check("session shutdown restores the previous custom editor", currentEditorFactory === originalEditorFactory);
 
 	// --- control inbox ---
 	control.queueSubagentMessage(agentDir2, { targetRunId: "child1", rootRunId: "root", text: "change direction" });
@@ -427,7 +480,15 @@ function check(name, cond, extra) {
 	}
 	check("failing child marked failed", polled && polled.status === "failed" && (polled.error || "").includes("fake failure"), polled && `${polled.status} ${polled.error}`);
 
-	// depth limit still throws synchronously
+	// depth and thinking validation still throw synchronously
+	let thinkingThrew = false;
+	try {
+		await spawn.startSubagent({ task: "x", thinking: "ultra" }, baseCtx());
+	} catch (error) {
+		thinkingThrew = String(error).includes("thinking level");
+	}
+	check("per-spawn invalid thinking throws", thinkingThrew);
+
 	let depthThrew = false;
 	try {
 		await spawn.startSubagent({ task: "x" }, { ...baseCtx(), currentDepth: 2 });
@@ -500,8 +561,11 @@ function check(name, cond, extra) {
 	activeOverlay.handleInput("\x1b[5~");
 	const afterPageScroll = activeOverlay.render(100).join("\n");
 	check("page scroll changes child transcript", beforePageScroll !== afterPageScroll && afterPageScroll.includes("navigation message"));
-	activeOverlay.handleInput("\x1b[<64;1;1M");
-	check("mouse wheel reaches child transcript", activeOverlay.render(100).join("\n") !== afterPageScroll);
+	activeOverlay.handleMouse({
+		type: "wheel", button: "none", x: 0, y: 0, screenX: 0, screenY: 0,
+		width: 100, height: 40, shift: false, alt: false, ctrl: false, wheelDelta: -1,
+	});
+	check("normalized mouse wheel reaches child transcript", activeOverlay.render(100).join("\n") !== afterPageScroll);
 	navPanel.handleInput("g");
 	navPanel.handleInput("o");
 	navPanel.handleInput("\r");
@@ -513,6 +577,41 @@ function check(name, cond, extra) {
 	navPanel.handleInput("\x1b[D");
 	check("left closes panel", focusedTarget.value === "null", focusedTarget.value);
 	navPanel.dispose();
+
+	// A footer selection indexes visible rows, not the full history array.
+	const selectionAgentDir = path.join(sandbox, "selection-agent");
+	const selectionCwd = path.join(sandbox, "selection-cwd");
+	fs.mkdirSync(selectionCwd, { recursive: true });
+	const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = selectionAgentDir;
+	const selectedSession = piRoot.SessionManager.create(selectionCwd);
+	selectedSession.appendMessage({ role: "user", content: "selected visible transcript", timestamp: Date.now() });
+	selectedSession.appendMessage({
+		role: "assistant",
+		content: [{ type: "text", text: "selected reply" }],
+		api: "test",
+		provider: "test",
+		model: "test",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "stop",
+		timestamp: Date.now(),
+	});
+	const selectionRegistry = path.join(sandbox, "selection-registry");
+	registry.saveRecord(selectionRegistry, mk("hidden", "selection-root", { footerDismissed: true }));
+	registry.saveRecord(selectionRegistry, mk("visible", "selection-root", {
+		cwd: selectionCwd,
+		sessionId: selectedSession.getSessionId(),
+	}));
+	const selectionPanel = new SubagentPanel(tui, theme, selectionRegistry, "selection-root");
+	tui.setFocus(selectionPanel);
+	selectionPanel.handleInput("\x1b[C");
+	activeOverlay.render(100);
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	const selectedTranscript = activeOverlay.render(100).join("\n");
+	check("transcript discovery follows the selected visible row", selectedTranscript.includes("selected visible transcript"), selectedTranscript);
+	selectionPanel.dispose();
+	if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
 
 	delete process.env.PI_SUBAGENT_COMMAND;
 
