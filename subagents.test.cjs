@@ -22,7 +22,7 @@ const jiti = createJiti(__filename, {
 	fsCache: false,
 	moduleCache: false,
 	alias: {
-		"@earendil-works/pi-coding-agent": path.join(PI, "dist", "index.js"),
+		"@earendil-works/pi-coding-agent": path.join(PI, "dist", "bundle", "index.js"),
 		"@earendil-works/pi-tui": path.join(PIN, "@earendil-works", "pi-tui", "dist", "index.js"),
 		typebox: require.resolve("typebox", { paths: [PI] }),
 	},
@@ -306,6 +306,19 @@ function check(name, cond, extra) {
 	await new Promise((r) => setTimeout(r, 250));
 	check("onSettled fired", settled.includes("completed"), JSON.stringify(settled));
 
+	process.env.FAKE_MODE = "split-utf8";
+	process.env.FAKE_TEXT = "unicode 😀 survives";
+	const unicodeRec = await spawn.startSubagent({ task: "unicode", name: "unicode-child" }, baseCtx());
+	delete process.env.FAKE_MODE;
+	delete process.env.FAKE_TEXT;
+	let unicodeDone;
+	for (let i = 0; i < 100; i++) {
+		unicodeDone = registry.readRecords(spawnAgentDir).find((r) => r.runId === unicodeRec.runId);
+		if (unicodeDone?.status === "completed") break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	check("split UTF-8 stdout is decoded intact", unicodeDone?.latestText === "unicode 😀 survives", unicodeDone?.latestText);
+
 	const steered = await spawn.sendSubagentMessage(polled, "focus on tests");
 	check("live RPC child accepts steering", steered === true);
 	for (let i = 0; i < 100; i++) {
@@ -353,6 +366,70 @@ function check(name, cond, extra) {
 	const rejectedDone = registry.readRecords(spawnAgentDir).find((r) => r.runId === rejectedRec.runId);
 	check("rejected RPC prompt fails without hanging", rejectedDone?.status === "failed" && rejectedDone.error?.includes("fake rejection"), rejectedDone && `${rejectedDone.status} ${rejectedDone.error}`);
 
+	process.env.FAKE_MODE = "ignore-state";
+	const timeoutRec = await spawn.startSubagent(
+		{ task: "never starts", name: "timeout-child" },
+		{ ...baseCtx(), rpcRequestTimeoutMs: 1000, rpcStartupTimeoutMs: 100 },
+	);
+	delete process.env.FAKE_MODE;
+	let timeoutDone;
+	for (let i = 0; i < 100; i++) {
+		timeoutDone = registry.readRecords(spawnAgentDir).find((r) => r.runId === timeoutRec.runId);
+		if (timeoutDone?.status === "failed") break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	check("RPC startup has a deadline", timeoutDone?.error?.includes("startup timed out"), timeoutDone && `${timeoutDone.status} ${timeoutDone.error}`);
+
+	const boundedRec = await spawn.startSubagent(
+		{ task: "ready", name: "bounded-child" },
+		{ ...baseCtx(), rpcRequestTimeoutMs: 100 },
+	);
+	let boundedDone;
+	for (let i = 0; i < 100; i++) {
+		boundedDone = registry.readRecords(spawnAgentDir).find((r) => r.runId === boundedRec.runId);
+		if (boundedDone?.status === "completed") break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	const abortController = new AbortController();
+	const abortTimer = setTimeout(() => abortController.abort(), 50);
+	let abortError;
+	try { await spawn.sendSubagentMessage(boundedDone, "hang", abortController.signal); } catch (error) { abortError = String(error); }
+	clearTimeout(abortTimer);
+	check("aborted RPC request rejects promptly", abortError?.includes("aborted"), abortError);
+	let requestError;
+	try { await spawn.sendSubagentMessage(boundedDone, "hang"); } catch (error) { requestError = String(error); }
+	check("RPC requests have a deadline", requestError?.includes("request timed out"), requestError);
+
+	process.env.FAKE_MODE = "close-stdin";
+	const writeRec = await spawn.startSubagent(
+		{ task: "cannot write", name: "write-child" },
+		{ ...baseCtx(), rpcRequestTimeoutMs: 2000, rpcStartupTimeoutMs: 2000 },
+	);
+	delete process.env.FAKE_MODE;
+	let writeDone;
+	for (let i = 0; i < 100; i++) {
+		writeDone = registry.readRecords(spawnAgentDir).find((r) => r.runId === writeRec.runId);
+		if (writeDone?.status === "failed") break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	check("RPC stdin errors fail without waiting for deadline", writeDone?.status === "failed" && !writeDone.error?.includes("timed out"), writeDone && `${writeDone.status} ${writeDone.error}`);
+
+	process.env.FAKE_MODE = "oversized-line";
+	process.env.FAKE_LINE_LENGTH = "4096";
+	const oversizedRec = await spawn.startSubagent(
+		{ task: "too much stdout", name: "oversized-child" },
+		{ ...baseCtx(), stdoutLineLimit: 512 },
+	);
+	delete process.env.FAKE_MODE;
+	delete process.env.FAKE_LINE_LENGTH;
+	let oversizedDone;
+	for (let i = 0; i < 100; i++) {
+		oversizedDone = registry.readRecords(spawnAgentDir).find((r) => r.runId === oversizedRec.runId);
+		if (oversizedDone?.status === "failed") break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	check("unterminated RPC stdout line is capped", oversizedDone?.error?.includes("stdout line exceeded 512"), oversizedDone && `${oversizedDone.status} ${oversizedDone.error}`);
+
 	process.env.FAKE_EXIT = "1";
 	const failRec = await spawn.startSubagent({ task: "fail", name: "failer" }, { ...baseCtx(), onSettled: (r) => settled.push(r.status) });
 	delete process.env.FAKE_EXIT;
@@ -390,13 +467,16 @@ function check(name, cond, extra) {
 		{ ...baseCtx(), settings: { maxDepth: 2, maxConcurrency: 1 } },
 	);
 	check("full gate queues the spawn", queuedRec.status === "queued", queuedRec.status);
+	const queuedSendStarted = Date.now();
+	const queuedAccepted = await spawn.sendSubagentMessage(queuedRec, "queued steer");
+	check("steering a queued child returns immediately", queuedAccepted && Date.now() - queuedSendStarted < 250, String(Date.now() - queuedSendStarted));
 	held();
 	for (let i = 0; i < 100; i++) {
 		polled = registry.readRecords(spawnAgentDir).find((r) => r.runId === queuedRec.runId);
-		if (polled && ["completed", "failed"].includes(polled.status)) break;
+		if (polled?.status === "completed" && polled.latestText === "steered: queued steer") break;
 		await new Promise((r) => setTimeout(r, 100));
 	}
-	check("queued child runs after release", polled && polled.status === "completed", polled && polled.status);
+	check("queued child receives startup steering", polled?.status === "completed" && polled.latestText === "steered: queued steer", polled && `${polled.status} ${polled.latestText}`);
 
 	// --- cancel race: a cancelled child must stay cancelled, not flip to failed ---
 	process.env.FAKE_DELAY_MS = "4000";

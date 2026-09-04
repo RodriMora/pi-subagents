@@ -256,11 +256,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		return matches[0]!;
 	};
 
-	const sendToRecord = async (record: AgentRecord, text: string): Promise<void> => {
+	const sendToRecord = async (record: AgentRecord, text: string, signal?: AbortSignal): Promise<void> => {
 		if (!runtime) throw new Error("Subagent extension settings failed to initialize");
 		const latest = readRecords(getAgentDir()).find((item) => item.runId === record.runId) ?? record;
 		if (latest.status === "cancelled") throw new Error(`${latest.name} was cancelled`);
-		if (await sendSubagentMessage(latest, text)) return;
+		if (await sendSubagentMessage(latest, text, signal)) return;
 		if (isTerminalStatus(latest.status) && (!latest.pid || !isProcessAlive(latest.pid))) {
 			throw new Error(`${latest.name} is no longer running`);
 		}
@@ -355,7 +355,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					currentDepth: runtime.depth,
 					settings: runtime.settings,
 					parentModel,
-					parentThinking: ctx.thinkingLevel,
+					parentThinking: ctx.thinkingLevel ?? "off",
 					parentCwd: ctx.cwd,
 					projectTrusted: runtime.projectTrusted,
 					persistAfterSettled: ctx.mode === "tui" || ctx.mode === "rpc",
@@ -402,7 +402,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			return new Text(`${theme.fg("toolTitle", theme.bold("spawn_agent"))} ${theme.fg("accent", name)}${theme.fg("dim", model)}`, 0, 0);
 		},
 		renderResult(result, _options, theme) {
-			const record = result.details?.record;
+			const record = (result.details as { record?: AgentRecord } | undefined)?.record;
 			if (!record) {
 				const text = result.content[0];
 				return new Text(text?.type === "text" ? text.text : "", 0, 0);
@@ -483,9 +483,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		description: "Send a course correction or follow-up to a live subagent by run id, session id, or exact name.",
 		promptSnippet: "Steer or follow up with a live background subagent",
 		parameters: SendSchema,
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, signal) {
 			const record = resolveRecord(params.target);
-			await sendToRecord(record, params.message);
+			await sendToRecord(record, params.message, signal);
 			return {
 				content: [{ type: "text", text: `Sent a message to ${record.name}.` }],
 				details: { record },

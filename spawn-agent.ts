@@ -2,12 +2,16 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { applyChildEvent, type ParsedChildState } from "./events.ts";
 import { descendantsOf, isProcessAlive, isTerminalStatus, readRecords, saveRecord } from "./registry.ts";
 import { EMPTY_USAGE, type AgentRecord, type SpawnAgentInput, type SubagentSettings } from "./types.ts";
 
 const STDERR_LIMIT = 4000;
+const RPC_REQUEST_TIMEOUT_MS = 15_000;
+const RPC_STARTUP_TIMEOUT_MS = 30_000;
+const STDOUT_LINE_LIMIT = 1024 * 1024;
 
 export class ConcurrencyGate {
 	private running = 0;
@@ -63,19 +67,27 @@ export class ConcurrencyGate {
 export const gate = new ConcurrencyGate();
 
 interface LiveChild {
-	sendMessage(message: string): Promise<void>;
+	sendMessage(message: string, signal?: AbortSignal): Promise<void>;
+}
+
+interface StartingChild {
+	messages: string[];
 }
 
 const liveChildren = new Map<string, LiveChild>();
-const startingChildren = new Map<string, Promise<LiveChild | null>>();
-const resolveStarting = new Map<string, (child: LiveChild | null) => void>();
+const startingChildren = new Map<string, StartingChild>();
 
-/** Send directly when this process owns the target child. */
-export async function sendSubagentMessage(record: AgentRecord, message: string): Promise<boolean> {
+/** Send directly when this process owns the target child, or queue while it starts. */
+export async function sendSubagentMessage(record: AgentRecord, message: string, signal?: AbortSignal): Promise<boolean> {
+	if (signal?.aborted) throw new Error("Subagent message was aborted");
+	const live = liveChildren.get(record.runId);
+	if (live) {
+		await live.sendMessage(message, signal);
+		return true;
+	}
 	const startup = startingChildren.get(record.runId);
-	const live = startup ? await startup : liveChildren.get(record.runId);
-	if (!live) return false;
-	await live.sendMessage(message);
+	if (!startup) return false;
+	startup.messages.push(message);
 	return true;
 }
 
@@ -95,6 +107,10 @@ export interface SpawnContext {
 	onUiRequest?: (record: AgentRecord, request: any) => Promise<Record<string, unknown> | void>;
 	/** Fired once per child when it reaches a terminal state. */
 	onSettled?: (record: AgentRecord) => void;
+	/** Test overrides for transport bounds. */
+	rpcRequestTimeoutMs?: number;
+	rpcStartupTimeoutMs?: number;
+	stdoutLineLimit?: number;
 }
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
@@ -229,7 +245,7 @@ export async function startSubagent(input: SpawnAgentInput, context: SpawnContex
 	saveRecord(context.agentDir, record);
 	context.onRecord?.(record);
 
-	startingChildren.set(record.runId, new Promise((resolveChild) => resolveStarting.set(record.runId, resolveChild)));
+	startingChildren.set(record.runId, { messages: [] });
 	void runSubagentProcess(input, context, record)
 		.catch((error) => {
 			if (isTerminalStatus(record.status)) return;
@@ -243,8 +259,6 @@ export async function startSubagent(input: SpawnAgentInput, context: SpawnContex
 			context.onSettled?.(record);
 		})
 		.finally(() => {
-			resolveStarting.get(record.runId)?.(isTerminalStatus(record.status) ? null : liveChildren.get(record.runId) ?? null);
-			resolveStarting.delete(record.runId);
 			startingChildren.delete(record.runId);
 		});
 	return record;
@@ -314,15 +328,29 @@ async function runSubagentProcess(
 
 		let stderr = "";
 		let buffer = "";
+		let transportError: string | undefined;
 		let requestId = 0;
 		let initialSettled = false;
+		let closing = false;
 		let resolveInitial!: () => void;
 		const initialDone = new Promise<void>((resolveDone) => {
 			resolveInitial = resolveDone;
 		});
 		const state: ParsedChildState = { finalText: "" };
-		const pending = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void }>();
+		type PendingRequest = {
+			resolve: (value: any) => void;
+			reject: (error: Error) => void;
+			timer: ReturnType<typeof setTimeout>;
+			signal?: AbortSignal;
+			onAbort?: () => void;
+		};
+		const pending = new Map<string, PendingRequest>();
 		const continuationReleases: Array<() => void> = [];
+		const stdoutDecoder = new StringDecoder("utf8");
+		const stderrDecoder = new StringDecoder("utf8");
+		const requestTimeoutMs = Math.max(1, context.rpcRequestTimeoutMs ?? RPC_REQUEST_TIMEOUT_MS);
+		const startupDeadline = Date.now() + Math.max(1, context.rpcStartupTimeoutMs ?? RPC_STARTUP_TIMEOUT_MS);
+		const stdoutLineLimit = Math.max(1, context.stdoutLineLimit ?? STDOUT_LINE_LIMIT);
 
 		const invocation = getPiInvocation(args);
 		const child = spawn(invocation.command, invocation.args, {
@@ -344,38 +372,112 @@ async function runSubagentProcess(
 		record.activity = "starting";
 		publish();
 
-		const send = (command: Record<string, unknown>): Promise<any> => {
-			const id = `subagent-${++requestId}`;
-			return new Promise((resolveCommand, rejectCommand) => {
-				pending.set(id, { resolve: resolveCommand, reject: rejectCommand });
-				if (!child.stdin.write(`${JSON.stringify({ ...command, id })}\n`)) {
-					child.stdin.once("drain", () => {});
+		const cleanupPending = (request: PendingRequest) => {
+			clearTimeout(request.timer);
+			if (request.signal && request.onAbort) request.signal.removeEventListener("abort", request.onAbort);
+		};
+		const rejectPending = (error: Error) => {
+			for (const request of pending.values()) {
+				cleanupPending(request);
+				request.reject(error);
+			}
+			pending.clear();
+		};
+		const failTransport = (error: Error) => {
+			if (transportError) return;
+			transportError = error.message;
+			rejectPending(error);
+			if (closing) return;
+			child.stdin.destroy();
+			if (record.pid && isProcessAlive(record.pid)) killPidTree(record.pid);
+		};
+		const writeLine = (value: Record<string, unknown>, id?: string) => {
+			if (child.stdin.destroyed || child.stdin.writableEnded) {
+				const error = new Error("Subagent RPC stdin is not writable");
+				if (id) {
+					const request = pending.get(id);
+					if (request) {
+						pending.delete(id);
+						cleanupPending(request);
+						request.reject(error);
+					}
 				}
+				failTransport(error);
+				return;
+			}
+			try {
+				child.stdin.write(`${JSON.stringify(value)}\n`, "utf8", (error) => {
+					if (error) failTransport(error);
+				});
+			} catch (error) {
+				failTransport(error instanceof Error ? error : new Error(String(error)));
+			}
+		};
+		const send = (
+			command: Record<string, unknown>,
+			options: { signal?: AbortSignal; deadline?: number } = {},
+		): Promise<any> => {
+			const id = `subagent-${++requestId}`;
+			const commandName = typeof command.type === "string" ? command.type : "RPC command";
+			const timeoutMs = Math.min(
+				requestTimeoutMs,
+				options.deadline === undefined ? requestTimeoutMs : Math.max(0, options.deadline - Date.now()),
+			);
+			if (options.signal?.aborted) return Promise.reject(new Error(`${commandName} was aborted`));
+			if (timeoutMs <= 0) return Promise.reject(new Error(`Subagent RPC startup timed out after ${context.rpcStartupTimeoutMs ?? RPC_STARTUP_TIMEOUT_MS}ms`));
+			return new Promise((resolveCommand, rejectCommand) => {
+				const finish = (error?: Error, value?: any) => {
+					const request = pending.get(id);
+					if (!request) return;
+					pending.delete(id);
+					cleanupPending(request);
+					if (error) request.reject(error);
+					else request.resolve(value);
+				};
+				const timer = setTimeout(() => {
+					const label = options.deadline === undefined ? `${commandName} request` : "Subagent RPC startup";
+					const error = new Error(`${label} timed out after ${timeoutMs}ms`);
+					finish(error);
+					failTransport(error);
+				}, timeoutMs);
+				timer.unref?.();
+				const onAbort = options.signal ? () => finish(new Error(`${commandName} was aborted`)) : undefined;
+				pending.set(id, { resolve: resolveCommand, reject: rejectCommand, timer, signal: options.signal, onAbort });
+				options.signal?.addEventListener("abort", onAbort!, { once: true });
+				writeLine({ ...command, id }, id);
 			});
 		};
 
+		let messageQueue = Promise.resolve();
 		const liveChild: LiveChild = {
-			async sendMessage(message: string) {
-				const followUp = isTerminalStatus(record.status);
-				const releaseTurn = followUp ? await gate.acquire(context.settings.maxConcurrency) : undefined;
-				if (releaseTurn) continuationReleases.push(releaseTurn);
-				try {
-					await send({
-						type: "prompt",
-						message,
-						...(followUp ? {} : { streamingBehavior: "steer" }),
-					});
-				} catch (error) {
-					if (releaseTurn) {
-						const index = continuationReleases.indexOf(releaseTurn);
-						if (index >= 0) continuationReleases.splice(index, 1);
-						releaseTurn();
+			sendMessage(message: string, signal?: AbortSignal) {
+				const result = messageQueue.then(async () => {
+					if (signal?.aborted) throw new Error("Subagent message was aborted");
+					const followUp = isTerminalStatus(record.status);
+					const releaseTurn = followUp ? await gate.acquire(context.settings.maxConcurrency, signal) : undefined;
+					if (releaseTurn) continuationReleases.push(releaseTurn);
+					try {
+						await send(
+							{
+								type: "prompt",
+								message,
+								...(followUp ? {} : { streamingBehavior: "steer" }),
+							},
+							{ signal },
+						);
+					} catch (error) {
+						if (releaseTurn) {
+							const index = continuationReleases.indexOf(releaseTurn);
+							if (index >= 0) continuationReleases.splice(index, 1);
+							releaseTurn();
+						}
+						throw error;
 					}
-					throw error;
-				}
+				});
+				messageQueue = result.catch(() => {});
+				return result;
 			},
 		};
-		liveChildren.set(record.runId, liveChild);
 
 		const processLine = (line: string) => {
 			if (!line.trim()) return;
@@ -389,6 +491,7 @@ async function runSubagentProcess(
 				const request = pending.get(event.id);
 				if (!request) return;
 				pending.delete(event.id);
+				cleanupPending(request);
 				if (event.success) request.resolve(event);
 				else request.reject(new Error(event.error || `${event.command || "RPC command"} failed`));
 				return;
@@ -398,14 +501,14 @@ async function runSubagentProcess(
 				if (context.onUiRequest) {
 					void context.onUiRequest(record, event).then(
 						(response) => {
-							if (dialog) child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: event.id, ...(response ?? { cancelled: true }) })}\n`);
+							if (dialog) writeLine({ type: "extension_ui_response", id: event.id, ...(response ?? { cancelled: true }) });
 						},
 						() => {
-							if (dialog) child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: event.id, cancelled: true })}\n`);
+							if (dialog) writeLine({ type: "extension_ui_response", id: event.id, cancelled: true });
 						},
 					);
 				} else if (dialog) {
-					child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: event.id, cancelled: true })}\n`);
+					writeLine({ type: "extension_ui_response", id: event.id, cancelled: true });
 				}
 				return;
 			}
@@ -433,31 +536,47 @@ async function runSubagentProcess(
 			schedulePublish(important);
 		};
 
-		child.stdout.on("data", (chunk) => {
-			buffer += chunk.toString();
+		const consumeStdout = (text: string) => {
+			if (!text || transportError) return;
+			buffer += text;
 			while (true) {
 				const newline = buffer.indexOf("\n");
-				if (newline < 0) break;
+				if (newline < 0) {
+					if (buffer.length > stdoutLineLimit) {
+						failTransport(new Error(`Subagent RPC stdout line exceeded ${stdoutLineLimit} characters`));
+					}
+					return;
+				}
+				if (newline > stdoutLineLimit) {
+					failTransport(new Error(`Subagent RPC stdout line exceeded ${stdoutLineLimit} characters`));
+					return;
+				}
 				let line = buffer.slice(0, newline);
 				buffer = buffer.slice(newline + 1);
 				if (line.endsWith("\r")) line = line.slice(0, -1);
 				processLine(line);
 			}
+		};
+		child.stdout.on("data", (chunk: Buffer) => {
+			consumeStdout(stdoutDecoder.write(chunk));
 		});
-		child.stderr.on("data", (chunk) => {
-			stderr = `${stderr}${chunk.toString()}`.slice(-STDERR_LIMIT);
+		child.stderr.on("data", (chunk: Buffer) => {
+			stderr = `${stderr}${stderrDecoder.write(chunk)}`.slice(-STDERR_LIMIT);
 		});
-		child.stdin.on("error", () => {});
+		child.stdin.on("error", (error) => failTransport(error));
 		child.on("close", (code) => {
+			closing = true;
 			liveChildren.delete(record.runId);
 			for (const releaseTurn of continuationReleases.splice(0)) releaseTurn();
-			if (buffer.trim()) processLine(buffer);
-			for (const request of pending.values()) request.reject(new Error(stderr.trim() || `Subagent exited with code ${code ?? 1}`));
-			pending.clear();
+			consumeStdout(stdoutDecoder.end());
+			stderr = `${stderr}${stderrDecoder.end()}`.slice(-STDERR_LIMIT);
+			if (!transportError && buffer.trim()) processLine(buffer);
+			const exitError = new Error(transportError || stderr.trim() || `Subagent exited with code ${code ?? 1}`);
+			rejectPending(exitError);
 			const wasCancelled = record.status === "cancelled" || diskCancelled();
 			record.pid = undefined;
 			if (!wasCancelled && !isTerminalStatus(record.status)) {
-				settle("failed", stderr.trim() || `Subagent exited with code ${code ?? 1}`);
+				settle("failed", exitError.message);
 			}
 			if (!initialSettled) {
 				initialSettled = true;
@@ -466,18 +585,24 @@ async function runSubagentProcess(
 		});
 		child.on("error", (error) => {
 			stderr = `${stderr}\n${error.message}`.slice(-STDERR_LIMIT);
+			failTransport(error);
 		});
 
 		try {
-			const stateResponse = await send({ type: "get_state" });
+			const stateResponse = await send({ type: "get_state" }, { signal: context.signal, deadline: startupDeadline });
 			if (typeof stateResponse.data?.sessionFile === "string") {
 				record.sessionFile = stateResponse.data.sessionFile;
 				publish();
 			} else {
 				record.sessionFile = await findSessionFile(record.cwd, record.runId);
 			}
-			await send({ type: "prompt", message: input.task });
-			resolveStarting.get(record.runId)?.(liveChild);
+			await send({ type: "prompt", message: input.task }, { signal: context.signal, deadline: startupDeadline });
+			const startup = startingChildren.get(record.runId);
+			liveChildren.set(record.runId, liveChild);
+			startingChildren.delete(record.runId);
+			for (const message of startup?.messages ?? []) {
+				void liveChild.sendMessage(message).catch(() => {});
+			}
 			await initialDone;
 		} catch (error) {
 			child.stdin.end();
