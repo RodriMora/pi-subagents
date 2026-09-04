@@ -77,6 +77,14 @@ function check(name, cond, extra) {
 		try { config.loadSettings({ agentDir, cwd: sandbox, projectTrusted: false, env: {} }); } catch { threw = true; }
 		check(`invalid ${label} throws`, threw);
 	}
+	fs.writeFileSync(path.join(agentDir, "subagents.json"), "{}");
+	let envThinkingThrew = false;
+	try {
+		config.loadSettings({ agentDir, cwd: sandbox, projectTrusted: false, env: { PI_SUBAGENT_DEFAULT_THINKING: "ultra" } });
+	} catch {
+		envThinkingThrew = true;
+	}
+	check("invalid environment thinking throws", envThinkingThrew);
 
 	// --- registry ---
 	const agentDir2 = path.join(sandbox, "agent2");
@@ -151,6 +159,70 @@ function check(name, cond, extra) {
 		const thirdText = thirdCheck.content[0].text;
 		check("later check omits all delivered results", !thirdText.includes("first result") && !thirdText.includes("second result"), thirdText);
 		check("later check explains no new results", thirdText.includes("No new subagent results since the last check."), thirdText);
+
+		// A recursive result belongs to its direct parent, even when the root can inspect it.
+		registry.saveRecord(checkAgentDir, checkRecord("owner-child", "completed", { latestText: "child result" }));
+		registry.saveRecord(checkAgentDir, mk("owner-grand", "owner-child", {
+			rootRunId: "check-parent", depth: 2, status: "completed", latestText: "grandchild result",
+		}));
+		const rootOwnershipCheck = await checkTool.execute("check-owner-root", { wait: false }, undefined, undefined, {});
+		const rootOwnershipText = rootOwnershipCheck.content[0].text;
+		const afterRootOwnership = registry.readRecords(checkAgentDir);
+		check("root claims its direct child result", afterRootOwnership.find((r) => r.runId === "owner-child")?.resultsDelivered === true);
+		check("root does not claim grandchild result", afterRootOwnership.find((r) => r.runId === "owner-grand")?.resultsDelivered !== true);
+		check("root can inspect grandchild result read-only", rootOwnershipText.includes("grandchild result") && rootOwnershipText.includes("read-only descendant"), rootOwnershipText);
+
+		const childHandlers = new Map();
+		const childTools = new Map();
+		const childPi = {
+			...checkPi,
+			on: (event, handler) => childHandlers.set(event, handler),
+			registerTool: (tool) => childTools.set(tool.name, tool),
+		};
+		process.env.PI_SUBAGENT_RUN_ID = "owner-child";
+		process.env.PI_SUBAGENT_ROOT_ID = "check-parent";
+		subagentsExtension(childPi);
+		await childHandlers.get("session_start")({}, {
+			sessionManager: { getSessionId: () => "owner-child" },
+			cwd: sandbox,
+			isProjectTrusted: () => false,
+			mode: "rpc",
+			hasUI: false,
+		});
+		delete process.env.PI_SUBAGENT_RUN_ID;
+		delete process.env.PI_SUBAGENT_ROOT_ID;
+		const childOwnershipCheck = await childTools.get("check_subagents").execute("check-owner-child", { wait: false }, undefined, undefined, {});
+		check("child receives grandchild result", childOwnershipCheck.content[0].text.includes("grandchild result"), childOwnershipCheck.content[0].text);
+		check("child claims grandchild result", registry.readRecords(checkAgentDir).find((r) => r.runId === "owner-grand")?.resultsDelivered === true);
+		const rootAfterParentClaim = await checkTool.execute("check-owner-root-again", { wait: false }, undefined, undefined, {});
+		check("root omits grandchild after parent claims it", !rootAfterParentClaim.content[0].text.includes("grandchild result"), rootAfterParentClaim.content[0].text);
+
+		let automaticGrandchildMessages = 0;
+		childPi.sendMessage = async (message) => {
+			if (message.content.includes("automatic-grand")) automaticGrandchildMessages++;
+		};
+		registry.saveRecord(checkAgentDir, mk("automatic-grand", "owner-child", {
+			rootRunId: "check-parent", depth: 2, status: "thinking", latestText: "automatic grandchild result",
+		}));
+		await childTools.get("cancel_subagent").execute("cancel-automatic-grand", { target: "automatic-grand" }, undefined, undefined, {});
+		for (let i = 0; i < 100 && automaticGrandchildMessages < 1; i++) await new Promise((r) => setTimeout(r, 25));
+		check("automatic grandchild delivery reaches direct parent", automaticGrandchildMessages === 1, String(automaticGrandchildMessages));
+		check("automatic grandchild delivery is claimed by direct parent", registry.readRecords(checkAgentDir).find((r) => r.runId === "automatic-grand")?.resultsDelivered === true);
+		childHandlers.get("session_shutdown")?.({}, { mode: "rpc" });
+
+		// A failed automatic send leaves the result pending and schedules another attempt.
+		let automaticSendAttempts = 0;
+		checkPi.sendMessage = () => {
+			automaticSendAttempts++;
+			if (automaticSendAttempts === 1) throw new Error("temporary send failure");
+		};
+		registry.saveRecord(checkAgentDir, checkRecord("retry-child", "thinking"));
+		await checkTools.get("cancel_subagent").execute("cancel-retry", { target: "retry-child" }, undefined, undefined, {});
+		for (let i = 0; i < 100 && automaticSendAttempts < 1; i++) await new Promise((r) => setTimeout(r, 25));
+		check("failed automatic send leaves result unclaimed", registry.readRecords(checkAgentDir).find((r) => r.runId === "retry-child")?.resultsDelivered !== true);
+		for (let i = 0; i < 100 && automaticSendAttempts < 2; i++) await new Promise((r) => setTimeout(r, 25));
+		check("failed automatic send is retried", automaticSendAttempts >= 2, String(automaticSendAttempts));
+		check("successful automatic retry claims result", registry.readRecords(checkAgentDir).find((r) => r.runId === "retry-child")?.resultsDelivered === true);
 	} finally {
 		checkHandlers.get("session_shutdown")?.({}, { mode: "rpc" });
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -160,6 +232,51 @@ function check(name, cond, extra) {
 		if (previousRootId === undefined) delete process.env.PI_SUBAGENT_ROOT_ID;
 		else process.env.PI_SUBAGENT_ROOT_ID = previousRootId;
 	}
+
+	// --- editor composition ---
+	const editorHandlers = new Map();
+	let installedEditorFactory;
+	let delegatedInput;
+	const existingEditor = {
+		render: () => [],
+		invalidate: () => {},
+		getText: () => "",
+		setText: () => {},
+		handleInput: (data) => { delegatedInput = data; },
+		isShowingAutocomplete: () => false,
+		getCursor: () => ({ line: 0, col: 0 }),
+		getLines: () => [""],
+	};
+	const originalEditorFactory = () => existingEditor;
+	let currentEditorFactory = originalEditorFactory;
+	const editorUi = {
+		setWidget: () => {},
+		getEditorComponent: () => currentEditorFactory,
+		setEditorComponent: (factory) => {
+			currentEditorFactory = factory;
+			if (factory !== originalEditorFactory) installedEditorFactory = factory;
+		},
+		notify: () => {},
+	};
+	const editorPi = {
+		...checkPi,
+		on: (event, handler) => editorHandlers.set(event, handler),
+	};
+	subagentsExtension(editorPi);
+	editorHandlers.get("session_start")({}, {
+		sessionManager: { getSessionId: () => "editor-parent" },
+		cwd: sandbox,
+		isProjectTrusted: () => false,
+		mode: "tui",
+		hasUI: true,
+		model: undefined,
+		ui: editorUi,
+	});
+	const composedEditor = installedEditorFactory({}, {}, { matches: () => false });
+	composedEditor.handleInput("z");
+	check("existing custom editor is composed instead of replaced", composedEditor === existingEditor && delegatedInput === "z");
+	editorHandlers.get("session_shutdown")?.({}, { mode: "tui", ui: editorUi });
+	check("session shutdown restores the previous custom editor", currentEditorFactory === originalEditorFactory);
 
 	// --- control inbox ---
 	control.queueSubagentMessage(agentDir2, { targetRunId: "child1", rootRunId: "root", text: "change direction" });
@@ -320,6 +437,19 @@ function check(name, cond, extra) {
 	await new Promise((r) => setTimeout(r, 250));
 	check("onSettled fired", settled.includes("completed"), JSON.stringify(settled));
 
+	process.env.FAKE_MODE = "split-utf8";
+	process.env.FAKE_TEXT = "unicode 😀 survives";
+	const unicodeRec = await spawn.startSubagent({ task: "unicode", name: "unicode-child" }, baseCtx());
+	delete process.env.FAKE_MODE;
+	delete process.env.FAKE_TEXT;
+	let unicodeDone;
+	for (let i = 0; i < 100; i++) {
+		unicodeDone = registry.readRecords(spawnAgentDir).find((r) => r.runId === unicodeRec.runId);
+		if (unicodeDone?.status === "completed") break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	check("split UTF-8 stdout is decoded intact", unicodeDone?.latestText === "unicode 😀 survives", unicodeDone?.latestText);
+
 	const steered = await spawn.sendSubagentMessage(polled, "focus on tests");
 	check("live RPC child accepts steering", steered === true);
 	for (let i = 0; i < 100; i++) {
@@ -367,6 +497,70 @@ function check(name, cond, extra) {
 	const rejectedDone = registry.readRecords(spawnAgentDir).find((r) => r.runId === rejectedRec.runId);
 	check("rejected RPC prompt fails without hanging", rejectedDone?.status === "failed" && rejectedDone.error?.includes("fake rejection"), rejectedDone && `${rejectedDone.status} ${rejectedDone.error}`);
 
+	process.env.FAKE_MODE = "ignore-state";
+	const timeoutRec = await spawn.startSubagent(
+		{ task: "never starts", name: "timeout-child" },
+		{ ...baseCtx(), rpcRequestTimeoutMs: 1000, rpcStartupTimeoutMs: 100 },
+	);
+	delete process.env.FAKE_MODE;
+	let timeoutDone;
+	for (let i = 0; i < 100; i++) {
+		timeoutDone = registry.readRecords(spawnAgentDir).find((r) => r.runId === timeoutRec.runId);
+		if (timeoutDone?.status === "failed") break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	check("RPC startup has a deadline", timeoutDone?.error?.includes("startup timed out"), timeoutDone && `${timeoutDone.status} ${timeoutDone.error}`);
+
+	const boundedRec = await spawn.startSubagent(
+		{ task: "ready", name: "bounded-child" },
+		{ ...baseCtx(), rpcRequestTimeoutMs: 100 },
+	);
+	let boundedDone;
+	for (let i = 0; i < 100; i++) {
+		boundedDone = registry.readRecords(spawnAgentDir).find((r) => r.runId === boundedRec.runId);
+		if (boundedDone?.status === "completed") break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	const abortController = new AbortController();
+	const abortTimer = setTimeout(() => abortController.abort(), 50);
+	let abortError;
+	try { await spawn.sendSubagentMessage(boundedDone, "hang", abortController.signal); } catch (error) { abortError = String(error); }
+	clearTimeout(abortTimer);
+	check("aborted RPC request rejects promptly", abortError?.includes("aborted"), abortError);
+	let requestError;
+	try { await spawn.sendSubagentMessage(boundedDone, "hang"); } catch (error) { requestError = String(error); }
+	check("RPC requests have a deadline", requestError?.includes("request timed out"), requestError);
+
+	process.env.FAKE_MODE = "close-stdin";
+	const writeRec = await spawn.startSubagent(
+		{ task: "cannot write", name: "write-child" },
+		{ ...baseCtx(), rpcRequestTimeoutMs: 2000, rpcStartupTimeoutMs: 2000 },
+	);
+	delete process.env.FAKE_MODE;
+	let writeDone;
+	for (let i = 0; i < 100; i++) {
+		writeDone = registry.readRecords(spawnAgentDir).find((r) => r.runId === writeRec.runId);
+		if (writeDone?.status === "failed") break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	check("RPC stdin errors fail without waiting for deadline", writeDone?.status === "failed" && !writeDone.error?.includes("timed out"), writeDone && `${writeDone.status} ${writeDone.error}`);
+
+	process.env.FAKE_MODE = "oversized-line";
+	process.env.FAKE_LINE_LENGTH = "4096";
+	const oversizedRec = await spawn.startSubagent(
+		{ task: "too much stdout", name: "oversized-child" },
+		{ ...baseCtx(), stdoutLineLimit: 512 },
+	);
+	delete process.env.FAKE_MODE;
+	delete process.env.FAKE_LINE_LENGTH;
+	let oversizedDone;
+	for (let i = 0; i < 100; i++) {
+		oversizedDone = registry.readRecords(spawnAgentDir).find((r) => r.runId === oversizedRec.runId);
+		if (oversizedDone?.status === "failed") break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	check("unterminated RPC stdout line is capped", oversizedDone?.error?.includes("stdout line exceeded 512"), oversizedDone && `${oversizedDone.status} ${oversizedDone.error}`);
+
 	process.env.FAKE_EXIT = "1";
 	const failRec = await spawn.startSubagent({ task: "fail", name: "failer" }, { ...baseCtx(), onSettled: (r) => settled.push(r.status) });
 	delete process.env.FAKE_EXIT;
@@ -377,7 +571,15 @@ function check(name, cond, extra) {
 	}
 	check("failing child marked failed", polled && polled.status === "failed" && (polled.error || "").includes("fake failure"), polled && `${polled.status} ${polled.error}`);
 
-	// depth limit still throws synchronously
+	// depth and thinking validation still throw synchronously
+	let thinkingThrew = false;
+	try {
+		await spawn.startSubagent({ task: "x", thinking: "ultra" }, baseCtx());
+	} catch (error) {
+		thinkingThrew = String(error).includes("thinking level");
+	}
+	check("per-spawn invalid thinking throws", thinkingThrew);
+
 	let depthThrew = false;
 	try {
 		await spawn.startSubagent({ task: "x" }, { ...baseCtx(), currentDepth: 2 });
@@ -415,13 +617,38 @@ function check(name, cond, extra) {
 		{ ...baseCtx(), settings: { maxDepth: 2, maxConcurrency: 1 } },
 	);
 	check("full gate queues the spawn", queuedRec.status === "queued", queuedRec.status);
+	const queuedSendStarted = Date.now();
+	const queuedAccepted = await spawn.sendSubagentMessage(queuedRec, "queued steer");
+	check("steering a queued child returns immediately", queuedAccepted && Date.now() - queuedSendStarted < 250, String(Date.now() - queuedSendStarted));
 	held();
 	for (let i = 0; i < 100; i++) {
 		polled = registry.readRecords(spawnAgentDir).find((r) => r.runId === queuedRec.runId);
-		if (polled && ["completed", "failed"].includes(polled.status)) break;
+		if (polled?.status === "completed" && polled.latestText === "steered: queued steer") break;
 		await new Promise((r) => setTimeout(r, 100));
 	}
-	check("queued child runs after release", polled && polled.status === "completed", polled && polled.status);
+	check("queued child receives startup steering", polled?.status === "completed" && polled.latestText === "steered: queued steer", polled && `${polled.status} ${polled.latestText}`);
+
+	const heldForAbort = await spawn.gate.acquire(1);
+	const abortQueuedCtl = new AbortController();
+	const abortQueued = await spawn.startSubagent(
+		{ task: "must not launch", name: "abort-queued" },
+		{ ...baseCtx(), settings: { maxDepth: 2, maxConcurrency: 1 }, signal: abortQueuedCtl.signal },
+	);
+	check("abort target starts queued", abortQueued.status === "queued", abortQueued.status);
+	abortQueuedCtl.abort();
+	await new Promise((r) => setTimeout(r, 20));
+	heldForAbort();
+	let abortQueuedFinal;
+	for (let i = 0; i < 50; i++) {
+		abortQueuedFinal = registry.readRecords(spawnAgentDir).find((r) => r.runId === abortQueued.runId);
+		if (abortQueuedFinal && ["failed", "cancelled"].includes(abortQueuedFinal.status)) break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	check(
+		"queued spawn abort does not launch a child",
+		abortQueuedFinal?.pid === undefined && !abortQueuedFinal?.latestText && String(abortQueuedFinal?.error || "").includes("aborted"),
+		JSON.stringify(abortQueuedFinal),
+	);
 
 	const heldForCancel = await spawn.gate.acquire(1);
 	const cancelledQueued = await spawn.startSubagent(
@@ -477,8 +704,11 @@ function check(name, cond, extra) {
 	activeOverlay.handleInput("\x1b[5~");
 	const afterPageScroll = activeOverlay.render(100).join("\n");
 	check("page scroll changes child transcript", beforePageScroll !== afterPageScroll && afterPageScroll.includes("navigation message"));
-	activeOverlay.handleInput("\x1b[<64;1;1M");
-	check("mouse wheel reaches child transcript", activeOverlay.render(100).join("\n") !== afterPageScroll);
+	activeOverlay.handleMouse({
+		type: "wheel", button: "none", x: 0, y: 0, screenX: 0, screenY: 0,
+		width: 100, height: 40, shift: false, alt: false, ctrl: false, wheelDelta: -1,
+	});
+	check("normalized mouse wheel reaches child transcript", activeOverlay.render(100).join("\n") !== afterPageScroll);
 	navPanel.handleInput("g");
 	navPanel.handleInput("o");
 	navPanel.handleInput("\r");
@@ -490,6 +720,41 @@ function check(name, cond, extra) {
 	navPanel.handleInput("\x1b[D");
 	check("left closes panel", focusedTarget.value === "null", focusedTarget.value);
 	navPanel.dispose();
+
+	// A footer selection indexes visible rows, not the full history array.
+	const selectionAgentDir = path.join(sandbox, "selection-agent");
+	const selectionCwd = path.join(sandbox, "selection-cwd");
+	fs.mkdirSync(selectionCwd, { recursive: true });
+	const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = selectionAgentDir;
+	const selectedSession = piRoot.SessionManager.create(selectionCwd);
+	selectedSession.appendMessage({ role: "user", content: "selected visible transcript", timestamp: Date.now() });
+	selectedSession.appendMessage({
+		role: "assistant",
+		content: [{ type: "text", text: "selected reply" }],
+		api: "test",
+		provider: "test",
+		model: "test",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "stop",
+		timestamp: Date.now(),
+	});
+	const selectionRegistry = path.join(sandbox, "selection-registry");
+	registry.saveRecord(selectionRegistry, mk("hidden", "selection-root", { footerDismissed: true }));
+	registry.saveRecord(selectionRegistry, mk("visible", "selection-root", {
+		cwd: selectionCwd,
+		sessionId: selectedSession.getSessionId(),
+	}));
+	const selectionPanel = new SubagentPanel(tui, theme, selectionRegistry, "selection-root");
+	tui.setFocus(selectionPanel);
+	selectionPanel.handleInput("\x1b[C");
+	activeOverlay.render(100);
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	const selectedTranscript = activeOverlay.render(100).join("\n");
+	check("transcript discovery follows the selected visible row", selectedTranscript.includes("selected visible transcript"), selectedTranscript);
+	selectionPanel.dispose();
+	if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
 
 	delete process.env.PI_SUBAGENT_COMMAND;
 
