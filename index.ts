@@ -12,7 +12,13 @@ import { currentDepth, loadSettings } from "./config.ts";
 import { consumeSubagentMessages, queueSubagentMessage } from "./control.ts";
 import { SubagentPanel } from "./panel.ts";
 import { isProcessAlive, isTerminalStatus, readRecords, saveRecord } from "./registry.ts";
-import { cancelSubagent, killPidTree, sendSubagentMessage, startSubagent } from "./spawn-agent.ts";
+import {
+	cancelSubagent,
+	killPidTree,
+	sendSubagentMessage,
+	startSubagent,
+	terminateOwnedSubagents,
+} from "./spawn-agent.ts";
 import { descendantsOf } from "./registry.ts";
 import type { AgentRecord, SubagentSettings } from "./types.ts";
 
@@ -286,7 +292,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		panel?.setMainModel(modelLabel(ctx));
 	});
 
-	pi.on("session_shutdown", (_event, ctx) => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		panel?.dispose();
 		panel = undefined;
 		if (ctx.mode === "tui") ctx.ui.setWidget("subagents", undefined);
@@ -306,15 +312,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		// RPC children stay resumable only for the lifetime of their parent session.
 		if (!runtime) return;
 		const agentDir = getAgentDir();
-		for (const record of descendantsOf(readRecords(agentDir), runtime.runId)) {
-			if (!record.pid || !isProcessAlive(record.pid)) continue;
+		const records = descendantsOf(readRecords(agentDir), runtime.runId);
+		for (const record of records.slice().reverse()) {
 			try {
-				if (isTerminalStatus(record.status)) killPidTree(record.pid);
-				else cancelSubagent(agentDir, record);
+				if (isTerminalStatus(record.status)) {
+					if (record.pid && isProcessAlive(record.pid)) killPidTree(record.pid, record.pidStartTime);
+				} else {
+					cancelSubagent(agentDir, record);
+				}
 			} catch {
-				// Best effort cleanup.
+				// Cross-process cleanup is best effort. Owned children are awaited below.
 			}
 		}
+		await terminateOwnedSubagents(records.map((record) => record.runId));
 	});
 
 	pi.registerCommand("subagents", {
@@ -355,7 +365,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					currentDepth: runtime.depth,
 					settings: runtime.settings,
 					parentModel,
-					parentThinking: ctx.thinkingLevel,
+					parentThinking: ctx.thinkingLevel ?? "off",
 					parentCwd: ctx.cwd,
 					projectTrusted: runtime.projectTrusted,
 					persistAfterSettled: ctx.mode === "tui" || ctx.mode === "rpc",
@@ -402,7 +412,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			return new Text(`${theme.fg("toolTitle", theme.bold("spawn_agent"))} ${theme.fg("accent", name)}${theme.fg("dim", model)}`, 0, 0);
 		},
 		renderResult(result, _options, theme) {
-			const record = result.details?.record;
+			const record = (result.details as { record?: AgentRecord } | undefined)?.record;
 			if (!record) {
 				const text = result.content[0];
 				return new Text(text?.type === "text" ? text.text : "", 0, 0);
