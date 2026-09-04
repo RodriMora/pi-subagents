@@ -27,8 +27,8 @@
     "image": "https://raw.githubusercontent.com/williamcr01/pi-subagents/main/assets/pi-subagents-demo.png"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.83.0",
-    "@earendil-works/pi-tui": "*",
+    "@earendil-works/pi-coding-agent": ">=0.85.0",
+    "@earendil-works/pi-tui": ">=0.85.0",
     "typebox": "*"
   }
 }

@@ -59,6 +59,12 @@ check_subagents({ wait: true, timeoutMs: 120000 })
 
 Use `send_to_subagent` to steer a running child or continue a completed one. Use `cancel_subagent` to stop a child. Both accept a run ID, session ID, or exact name.
 
+## Isolation model
+
+Each child has a separate Pi process and session, but it is not an OS sandbox. Children use the same user account, filesystem permissions, environment, and installed extensions as the parent.
+
+A trusted parent passes project approval only when the child's canonical working directory remains inside the parent's canonical directory. A symlink that points outside that tree does not inherit approval, so Pi evaluates trust for the target directory normally.
+
 In TUI mode, press **Down** at the bottom of the editor to open the live subagent panel. Open a transcript, type a message, and press **Enter** to steer or continue that subagent. Use `/subagents` to review finished agents and transcripts.
 
 ## Tools
@@ -82,7 +88,7 @@ Optional fields are `name`, `cwd`, `model`, `thinking`, and an exact `tools` all
 2. `defaultModel` in configuration
 3. The creating agent's active model
 
-When the creating session has a model scope from Pi's `--models` flag or `enabledModels` setting, the selected child model must be in that scope. The scope and its pinned thinking levels are passed to the child, so descendants cannot escape it. An empty scope keeps Pi's unrestricted model behavior.
+When the creating session has a model scope from Pi's `--models` flag or `enabledModels` setting, the selected child model must be in that scope. The scope and its pinned thinking levels are passed to the child. A pin is applied as the child's `--thinking` value; an explicit `thinking` that disagrees with the pin is rejected. An empty scope keeps Pi's unrestricted model behavior.
 
 Omitting `tools` copies the creating session's active tool set. An explicit list can only remove tools from that set, and `tools: []` starts the child with `--no-tools`. Include `spawn_agent` to allow recursive delegation. A child receives it automatically only when `spawn_agent` is active in the parent and `tools` is omitted or explicitly includes it.
 
@@ -116,7 +122,7 @@ cancel_subagent({ target: "auth-reviewer" })
 
 ## Configuration
 
-Global settings live at `~/.pi/agent/subagents.json`. A trusted project's `.pi/subagents.json` can override them for that project.
+Global settings live at `~/.pi/agent/subagents.json`. A trusted project's `<configDir>/subagents.json` (`.pi` by default; Pi's `CONFIG_DIR_NAME`) can override them for that project.
 
 ```json
 {

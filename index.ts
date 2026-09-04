@@ -4,15 +4,22 @@ import {
 	getAgentDir,
 	getMarkdownTheme,
 	type ExtensionAPI,
+	type ExtensionUIContext,
 	type KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { Key, Markdown, matchesKey, Text, type EditorTheme, type TUI } from "@earendil-works/pi-tui";
+import { Key, Markdown, matchesKey, Text, type EditorComponent } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { currentDepth, loadSettings } from "./config.ts";
+import { currentDepth, loadSettings, THINKING_LEVEL_VALUES } from "./config.ts";
 import { consumeSubagentMessages, queueSubagentMessage } from "./control.ts";
 import { SubagentPanel } from "./panel.ts";
 import { isProcessAlive, isTerminalStatus, readRecords, saveRecord } from "./registry.ts";
-import { cancelSubagent, killPidTree, sendSubagentMessage, startSubagent } from "./spawn-agent.ts";
+import {
+	cancelSubagent,
+	killPidTree,
+	sendSubagentMessage,
+	startSubagent,
+	terminateOwnedSubagents,
+} from "./spawn-agent.ts";
 import { descendantsOf } from "./registry.ts";
 import type { AgentRecord, SubagentSettings } from "./types.ts";
 
@@ -24,12 +31,51 @@ interface RuntimeState {
 	projectTrusted: boolean;
 }
 
+type EditorFactory = ReturnType<ExtensionUIContext["getEditorComponent"]>;
+
+interface CursorAwareEditor extends EditorComponent {
+	isShowingAutocomplete(): boolean;
+	getCursor(): { line: number; col: number };
+	getLines(): string[];
+}
+
+function isCursorAwareEditor(editor: EditorComponent): editor is CursorAwareEditor {
+	const candidate = editor as Partial<CursorAwareEditor>;
+	return (
+		typeof candidate.isShowingAutocomplete === "function" &&
+		typeof candidate.getCursor === "function" &&
+		typeof candidate.getLines === "function"
+	);
+}
+
+function composePanelNavigation(
+	editor: EditorComponent,
+	keybindings: KeybindingsManager,
+	openPanel: () => boolean | undefined,
+): EditorComponent {
+	if (!isCursorAwareEditor(editor)) return editor;
+	const handleInput = editor.handleInput.bind(editor);
+	editor.handleInput = (data: string) => {
+		const isDown = keybindings.matches(data, "tui.editor.cursorDown") || matchesKey(data, Key.down);
+		if (isDown && !editor.isShowingAutocomplete()) {
+			const cursor = editor.getCursor();
+			const lines = editor.getLines();
+			const lastLine = lines.length - 1;
+			if (cursor.line === lastLine && cursor.col === (lines[lastLine]?.length ?? 0) && openPanel()) return;
+		}
+		handleInput(data);
+	};
+	return editor;
+}
+
 const SpawnAgentSchema = Type.Object({
 	task: Type.String({ description: "Focused task to delegate to the subagent" }),
 	name: Type.Optional(Type.String({ description: "Readable subagent name" })),
 	cwd: Type.Optional(Type.String({ description: "Working directory, relative to the current agent unless absolute" })),
 	model: Type.Optional(Type.String({ description: "Exact model selector. Overrides configured and inherited defaults." })),
-	thinking: Type.Optional(Type.String({ description: "Thinking level for this subagent" })),
+	thinking: Type.Optional(
+		Type.String({ description: "Thinking level for this subagent", enum: [...THINKING_LEVEL_VALUES] }),
+	),
 	tools: Type.Optional(Type.Array(Type.String(), { description: "Exact subset of the creating session's active tools; omit to inherit all active tools" })),
 });
 
@@ -62,8 +108,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	let panel: SubagentPanel | undefined;
 	let mainModel: string | undefined;
 	let deliveryTimer: ReturnType<typeof setTimeout> | undefined;
+	let deliveryRetryDelay = 1000;
 	let keepAlive: ReturnType<typeof setInterval> | undefined;
 	let inboxTimer: ReturnType<typeof setInterval> | undefined;
+	let previousEditorFactory: EditorFactory;
+	let installedEditorFactory: EditorFactory;
 
 	const modelLabel = (ctx: { model?: { provider: string; id: string } }): string | undefined =>
 		ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
@@ -83,28 +132,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	};
 
 	/** Deliver finished-but-undelivered child results to this session, debounced so parallel finishes batch into one message. */
-	const scheduleDelivery = () => {
+	const scheduleDelivery = (delay = 1000) => {
 		if (deliveryTimer) return;
-		deliveryTimer = setTimeout(() => {
+		deliveryTimer = setTimeout(async () => {
 			deliveryTimer = undefined;
 			try {
-				deliverResults();
+				await deliverResults();
+				deliveryRetryDelay = 1000;
 			} catch {
-				// Delivery is best-effort; the registry keeps the results either way.
+				// Keep the result unclaimed and back off while this session is alive.
+				const retryDelay = deliveryRetryDelay;
+				deliveryRetryDelay = Math.min(deliveryRetryDelay * 2, 30000);
+				scheduleDelivery(retryDelay);
 			}
-		}, 1000);
+		}, delay);
 		deliveryTimer.unref?.();
 	};
 
-	const deliverResults = () => {
+	const deliverResults = async () => {
 		if (!runtime) return;
 		const agentDir = getAgentDir();
 		const children = readRecords(agentDir).filter((record) => record.parentRunId === runtime!.runId);
 		const pending = children.filter((record) => isTerminalStatus(record.status) && !record.resultsDelivered);
 		if (pending.length === 0) return;
-		for (const record of pending) {
-			saveRecord(agentDir, { ...record, resultsDelivered: true, updatedAt: new Date().toISOString() });
-		}
 		const stillRunning = children.filter((record) => !isTerminalStatus(record.status)).length;
 		const parts = pending.map((record) => {
 			const head = `### ${record.name} — ${record.status}`;
@@ -127,6 +177,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			},
 			{ triggerTurn: true, deliverAs: "followUp" },
 		);
+		for (const record of pending) {
+			try {
+				saveRecord(agentDir, { ...record, resultsDelivered: true, updatedAt: new Date().toISOString() });
+			} catch {
+				// The message was accepted. Do not resend it in a tight loop when claim persistence fails.
+			}
+		}
 	};
 
 	pi.registerFlag("subagent-depth", {
@@ -179,33 +236,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 		mainModel = modelLabel(ctx);
 
-		class SubagentEditor extends CustomEditor {
-			private readonly keys: KeybindingsManager;
-
-			constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) {
-				super(tui, theme, keybindings);
-				this.keys = keybindings;
-			}
-
-			handleInput(data: string): void {
-				// Only steal Down when the cursor cannot move further down, so
-				// multiline editing and history navigation keep working.
-				if (!this.isShowingAutocomplete() && this.keys.matches(data, "tui.editor.cursorDown")) {
-					const cursor = this.getCursor();
-					const lines = this.getLines();
-					const lastLine = lines.length - 1;
-					if (cursor.line === lastLine && cursor.col === (lines[lastLine]?.length ?? 0) && panel?.open()) return;
-				} else if (matchesKey(data, Key.down) && !this.isShowingAutocomplete()) {
-					const cursor = this.getCursor();
-					const lines = this.getLines();
-					const lastLine = lines.length - 1;
-					if (cursor.line === lastLine && cursor.col === (lines[lastLine]?.length ?? 0) && panel?.open()) return;
-				}
-				super.handleInput(data);
-			}
-		}
-
-		let editor: SubagentEditor | undefined;
+		let editor: EditorComponent | undefined;
 		ctx.ui.setWidget(
 			"subagents",
 			(tui, theme) => {
@@ -227,11 +258,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			{ placement: "belowEditor" },
 		);
 
-		ctx.ui.setEditorComponent((tui, theme, keybindings) => {
-			editor = new SubagentEditor(tui, theme, keybindings);
+		previousEditorFactory = ctx.ui.getEditorComponent();
+		installedEditorFactory = (tui, theme, keybindings) => {
+			const baseEditor = previousEditorFactory?.(tui, theme, keybindings) ?? new CustomEditor(tui, theme, keybindings);
+			editor = composePanelNavigation(baseEditor, keybindings, () => panel?.open());
 			panel?.setEditor(editor);
 			return editor;
-		});
+		};
+		ctx.ui.setEditorComponent(installedEditorFactory);
 	});
 
 	pi.registerMessageRenderer("subagent-results", (message, _options, _theme) => {
@@ -256,11 +290,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		return matches[0]!;
 	};
 
-	const sendToRecord = async (record: AgentRecord, text: string): Promise<void> => {
+	const sendToRecord = async (record: AgentRecord, text: string, signal?: AbortSignal): Promise<void> => {
 		if (!runtime) throw new Error("Subagent extension settings failed to initialize");
 		const latest = readRecords(getAgentDir()).find((item) => item.runId === record.runId) ?? record;
 		if (latest.status === "cancelled") throw new Error(`${latest.name} was cancelled`);
-		if (await sendSubagentMessage(latest, text)) return;
+		if (await sendSubagentMessage(latest, text, signal)) return;
 		if (isTerminalStatus(latest.status) && (!latest.pid || !isProcessAlive(latest.pid))) {
 			throw new Error(`${latest.name} is no longer running`);
 		}
@@ -286,10 +320,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		panel?.setMainModel(modelLabel(ctx));
 	});
 
-	pi.on("session_shutdown", (_event, ctx) => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		panel?.dispose();
 		panel = undefined;
-		if (ctx.mode === "tui") ctx.ui.setWidget("subagents", undefined);
+		if (ctx.mode === "tui") {
+			ctx.ui.setWidget("subagents", undefined);
+			if (ctx.ui.getEditorComponent() === installedEditorFactory) {
+				ctx.ui.setEditorComponent(previousEditorFactory);
+			}
+			previousEditorFactory = undefined;
+			installedEditorFactory = undefined;
+		}
 		if (deliveryTimer) {
 			clearTimeout(deliveryTimer);
 			deliveryTimer = undefined;
@@ -306,15 +347,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		// RPC children stay resumable only for the lifetime of their parent session.
 		if (!runtime) return;
 		const agentDir = getAgentDir();
-		for (const record of descendantsOf(readRecords(agentDir), runtime.runId)) {
-			if (!record.pid || !isProcessAlive(record.pid)) continue;
+		const records = descendantsOf(readRecords(agentDir), runtime.runId);
+		for (const record of records.slice().reverse()) {
 			try {
-				if (isTerminalStatus(record.status)) killPidTree(record.pid);
-				else cancelSubagent(agentDir, record);
+				if (isTerminalStatus(record.status)) {
+					if (record.pid && isProcessAlive(record.pid)) killPidTree(record.pid, record.pidStartTime);
+				} else {
+					cancelSubagent(agentDir, record);
+				}
 			} catch {
-				// Best effort cleanup.
+				// Cross-process cleanup is best effort. Owned children are awaited below.
 			}
 		}
+		await terminateOwnedSubagents(records.map((record) => record.runId));
 	});
 
 	pi.registerCommand("subagents", {
@@ -441,9 +486,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			// Refresh before claiming results so auto-delivery that happened while
 			// waiting is not repeated by this check.
 			rows = snapshot();
-			// Only terminal results not already delivered are shown. Marking them
-			// delivered also prevents the automatic path from injecting them again.
-			const newlyFinished = rows.filter((record) => isTerminalStatus(record.status) && !record.resultsDelivered);
+			// This session owns delivery only for its direct children. Descendant
+			// results remain visible, but their direct parent must claim them.
+			const newlyFinished = rows.filter(
+				(record) => record.parentRunId === runtime!.runId && isTerminalStatus(record.status) && !record.resultsDelivered,
+			);
 			for (const record of newlyFinished) {
 				saveRecord(agentDir, { ...record, resultsDelivered: true, updatedAt: new Date().toISOString() });
 			}
@@ -453,9 +500,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			const running = rows.filter((record) => !isTerminalStatus(record.status));
 			const newlyFinishedIds = new Set(newlyFinished.map((record) => record.runId));
 			const sections = rows
-				.filter((record) => !isTerminalStatus(record.status) || newlyFinishedIds.has(record.runId))
+				.filter(
+					(record) =>
+						!isTerminalStatus(record.status) ||
+						newlyFinishedIds.has(record.runId) ||
+						(record.parentRunId !== runtime!.runId && !record.resultsDelivered),
+				)
 				.map((record) => {
-					const meta = `${record.model} · depth ${record.depth}/${record.maxDepth} · ${record.cwd}${record.runId ? ` · run ${shortId(record.runId)}` : ""}`;
+					const readOnly = record.parentRunId !== runtime!.runId ? " · read-only descendant" : "";
+					const meta = `${record.model} · depth ${record.depth}/${record.maxDepth} · ${record.cwd}${record.runId ? ` · run ${shortId(record.runId)}` : ""}${readOnly}`;
 					let body: string;
 					if (isTerminalStatus(record.status)) {
 						body =
@@ -485,9 +538,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		description: "Send a course correction or follow-up to a live subagent by run id, session id, or exact name.",
 		promptSnippet: "Steer or follow up with a live background subagent",
 		parameters: SendSchema,
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, signal) {
 			const record = resolveRecord(params.target);
-			await sendToRecord(record, params.message);
+			await sendToRecord(record, params.message, signal);
 			return {
 				content: [{ type: "text", text: `Sent a message to ${record.name}.` }],
 				details: { record },

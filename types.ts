@@ -25,6 +25,8 @@ export interface AgentRecord {
 	sessionId: string;
 	sessionFile?: string;
 	pid?: number;
+	/** Linux /proc start time used to reject stale PID reuse during cleanup. */
+	pidStartTime?: string;
 	name: string;
 	task: string;
 	cwd: string;
