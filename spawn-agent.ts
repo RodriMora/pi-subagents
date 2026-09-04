@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { validateThinkingLevel } from "./config.ts";
 import { applyChildEvent, type ParsedChildState } from "./events.ts";
 import { descendantsOf, isProcessAlive, isTerminalStatus, readRecords, saveRecord } from "./registry.ts";
 import { EMPTY_USAGE, type AgentRecord, type SpawnAgentInput, type SubagentSettings } from "./types.ts";
@@ -86,7 +87,7 @@ export interface SpawnContext {
 	currentDepth: number;
 	settings: SubagentSettings;
 	parentModel?: string;
-	parentThinking: string;
+	parentThinking?: string;
 	parentCwd: string;
 	projectTrusted: boolean;
 	persistAfterSettled?: boolean;
@@ -204,7 +205,12 @@ export async function startSubagent(input: SpawnAgentInput, context: SpawnContex
 	if (!model) {
 		throw new Error("No subagent model is available; choose a parent model or configure defaultModel");
 	}
-	const thinking = input.thinking?.trim() || context.settings.defaultThinking || context.parentThinking;
+	const thinking = validateThinkingLevel(
+		input.thinking !== undefined
+			? input.thinking
+			: context.settings.defaultThinking || context.parentThinking || "off",
+		"thinking",
+	);
 	const now = new Date().toISOString();
 	const record: AgentRecord = {
 		version: 1,
