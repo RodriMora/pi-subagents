@@ -44,7 +44,7 @@ function check(name, cond, extra) {
 	const control = await jiti.import(path.join(HERE, "control.ts"));
 	const spawn = await jiti.import(path.join(HERE, "spawn-agent.ts"));
 	const { SubagentPanel } = await jiti.import(path.join(HERE, "panel.ts"));
-	await jiti.import(path.join(HERE, "index.ts"));
+	const { default: subagentsExtension } = await jiti.import(path.join(HERE, "index.ts"));
 
 	// --- config ---
 	const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "subagents-test-"));
@@ -99,6 +99,67 @@ function check(name, cond, extra) {
 	check("descendants order", JSON.stringify(desc) === JSON.stringify(["child1", "grand", "child2"]), desc.join(","));
 	const depths = registry.relativeDepths(all, "root");
 	check("relative depths", depths.get("child1") === 0 && depths.get("grand") === 1, JSON.stringify([...depths]));
+
+	// --- incremental check results ---
+	const checkAgentDir = path.join(sandbox, "check-agent");
+	fs.mkdirSync(checkAgentDir, { recursive: true });
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const previousRunId = process.env.PI_SUBAGENT_RUN_ID;
+	const previousRootId = process.env.PI_SUBAGENT_ROOT_ID;
+	delete process.env.PI_SUBAGENT_RUN_ID;
+	delete process.env.PI_SUBAGENT_ROOT_ID;
+	process.env.PI_CODING_AGENT_DIR = checkAgentDir;
+	const checkHandlers = new Map();
+	const checkTools = new Map();
+	const checkPi = {
+		registerFlag: () => {},
+		on: (event, handler) => checkHandlers.set(event, handler),
+		registerMessageRenderer: () => {},
+		registerCommand: () => {},
+		registerTool: (tool) => checkTools.set(tool.name, tool),
+		getFlag: () => undefined,
+		sendMessage: () => {},
+		sendUserMessage: () => {},
+	};
+	try {
+		subagentsExtension(checkPi);
+		await checkHandlers.get("session_start")({}, {
+			sessionManager: { getSessionId: () => "check-parent" },
+			cwd: sandbox,
+			isProjectTrusted: () => false,
+			mode: "rpc",
+			hasUI: false,
+		});
+		const checkTool = checkTools.get("check_subagents");
+		const checkRecord = (runId, status, extra = {}) => mk(runId, "check-parent", { rootRunId: "check-parent", status, ...extra });
+		registry.saveRecord(checkAgentDir, checkRecord("first", "completed", { latestText: "first result" }));
+		registry.saveRecord(checkAgentDir, checkRecord("second", "thinking", { activity: "working" }));
+		const firstCheck = await checkTool.execute("check-1", { wait: false }, undefined, undefined, {});
+		const firstText = firstCheck.content[0].text;
+		check("first check returns first result", firstText.includes("first result"), firstText);
+		check("first check reports second running", firstText.includes("second") && firstText.includes("still running"), firstText);
+
+		const finishTimer = setTimeout(() => {
+			registry.saveRecord(checkAgentDir, checkRecord("second", "completed", { latestText: "second result" }));
+		}, 50);
+		const secondCheck = await checkTool.execute("check-2", { wait: true, timeoutMs: 1000 }, undefined, undefined, {});
+		clearTimeout(finishTimer);
+		const secondText = secondCheck.content[0].text;
+		check("second check returns newly finished result", secondText.includes("second result"), secondText);
+		check("second check omits previously delivered result", !secondText.includes("first result"), secondText);
+		const thirdCheck = await checkTool.execute("check-3", { wait: false }, undefined, undefined, {});
+		const thirdText = thirdCheck.content[0].text;
+		check("later check omits all delivered results", !thirdText.includes("first result") && !thirdText.includes("second result"), thirdText);
+		check("later check explains no new results", thirdText.includes("No new subagent results since the last check."), thirdText);
+	} finally {
+		checkHandlers.get("session_shutdown")?.({}, { mode: "rpc" });
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		if (previousRunId === undefined) delete process.env.PI_SUBAGENT_RUN_ID;
+		else process.env.PI_SUBAGENT_RUN_ID = previousRunId;
+		if (previousRootId === undefined) delete process.env.PI_SUBAGENT_ROOT_ID;
+		else process.env.PI_SUBAGENT_ROOT_ID = previousRootId;
+	}
 
 	// --- control inbox ---
 	control.queueSubagentMessage(agentDir2, { targetRunId: "child1", rootRunId: "root", text: "change direction" });

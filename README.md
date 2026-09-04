@@ -86,7 +86,7 @@ Thinking level follows the same precedence and is clamped to the selected child 
 
 ### `check_subagents`
 
-Inspect descendants and collect results. Use `wait: true` before relying on work that is still running:
+Inspect descendants and collect newly finished results without repeating results already delivered. Use `wait: true` before relying on work that is still running:
 
 ```text
 check_subagents({ wait: true, timeoutMs: 120000 })

@@ -419,7 +419,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		name: "check_subagents",
 		label: "Check Subagents",
 		description:
-			"Check the status of this session's subagents and collect finished results. Use wait:true to block until they all finish (or the timeout elapses) before relying on their output.",
+			"Check the status of this session's subagents and collect newly finished results without repeating ones already delivered. Use wait:true to block until they all finish (or the timeout elapses) before relying on their output.",
 		promptSnippet: "Check or wait for background subagent results",
 		parameters: CheckSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -436,36 +436,42 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					rows = snapshot();
 				}
 			}
-			// Results returned here count as delivered, so auto-delivery does not
-			// inject them again when the session goes idle.
-			for (const record of rows) {
-				if (isTerminalStatus(record.status) && !record.resultsDelivered) {
-					saveRecord(agentDir, { ...record, resultsDelivered: true, updatedAt: new Date().toISOString() });
-				}
+			// Refresh before claiming results so auto-delivery that happened while
+			// waiting is not repeated by this check.
+			rows = snapshot();
+			// Only terminal results not already delivered are shown. Marking them
+			// delivered also prevents the automatic path from injecting them again.
+			const newlyFinished = rows.filter((record) => isTerminalStatus(record.status) && !record.resultsDelivered);
+			for (const record of newlyFinished) {
+				saveRecord(agentDir, { ...record, resultsDelivered: true, updatedAt: new Date().toISOString() });
 			}
 			if (rows.length === 0) {
 				return { content: [{ type: "text", text: "No subagents have been spawned by this session." }], details: { records: [] } };
 			}
 			const running = rows.filter((record) => !isTerminalStatus(record.status));
-			const sections = rows.map((record) => {
-				const meta = `${record.model} · depth ${record.depth}/${record.maxDepth} · ${record.cwd}${record.runId ? ` · run ${shortId(record.runId)}` : ""}`;
-				let body: string;
-				if (isTerminalStatus(record.status)) {
-					body =
-						record.status === "completed"
-							? cap(record.latestText || "(no output)", RESULT_OUTPUT_CAP)
-							: cap(record.error || record.status, RESULT_OUTPUT_CAP);
-				} else {
-					body = `still running: ${record.currentTool || record.activity || record.status}`;
-				}
-				return `### ${record.name} — ${record.status}\n${meta}\n\n${body}`;
-			});
+			const newlyFinishedIds = new Set(newlyFinished.map((record) => record.runId));
+			const sections = rows
+				.filter((record) => !isTerminalStatus(record.status) || newlyFinishedIds.has(record.runId))
+				.map((record) => {
+					const meta = `${record.model} · depth ${record.depth}/${record.maxDepth} · ${record.cwd}${record.runId ? ` · run ${shortId(record.runId)}` : ""}`;
+					let body: string;
+					if (isTerminalStatus(record.status)) {
+						body =
+							record.status === "completed"
+								? cap(record.latestText || "(no output)", RESULT_OUTPUT_CAP)
+								: cap(record.error || record.status, RESULT_OUTPUT_CAP);
+					} else {
+						body = `still running: ${record.currentTool || record.activity || record.status}`;
+					}
+					return `### ${record.name} — ${record.status}\n${meta}\n\n${body}`;
+				});
 			const summary =
 				running.length > 0
 					? `${rows.length - running.length}/${rows.length} finished, ${running.length} still running.`
 					: `All ${rows.length} subagent${rows.length === 1 ? "" : "s"} finished.`;
+			const sectionText = sections.length > 0 ? sections.join("\n\n") : "No new subagent results since the last check.";
 			return {
-				content: [{ type: "text", text: `${summary}\n\n${sections.join("\n\n")}` }],
+				content: [{ type: "text", text: `${summary}\n\n${sectionText}` }],
 				details: { records: rows },
 			};
 		},
