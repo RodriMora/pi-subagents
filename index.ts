@@ -4,11 +4,12 @@ import {
 	getAgentDir,
 	getMarkdownTheme,
 	type ExtensionAPI,
+	type ExtensionUIContext,
 	type KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { Key, Markdown, matchesKey, Text, type EditorTheme, type TUI } from "@earendil-works/pi-tui";
+import { Key, Markdown, matchesKey, Text, type EditorComponent } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { currentDepth, loadSettings } from "./config.ts";
+import { currentDepth, loadSettings, THINKING_LEVEL_VALUES } from "./config.ts";
 import { consumeSubagentMessages, queueSubagentMessage } from "./control.ts";
 import { SubagentPanel } from "./panel.ts";
 import { isProcessAlive, isTerminalStatus, readRecords, saveRecord } from "./registry.ts";
@@ -24,12 +25,51 @@ interface RuntimeState {
 	projectTrusted: boolean;
 }
 
+type EditorFactory = ReturnType<ExtensionUIContext["getEditorComponent"]>;
+
+interface CursorAwareEditor extends EditorComponent {
+	isShowingAutocomplete(): boolean;
+	getCursor(): { line: number; col: number };
+	getLines(): string[];
+}
+
+function isCursorAwareEditor(editor: EditorComponent): editor is CursorAwareEditor {
+	const candidate = editor as Partial<CursorAwareEditor>;
+	return (
+		typeof candidate.isShowingAutocomplete === "function" &&
+		typeof candidate.getCursor === "function" &&
+		typeof candidate.getLines === "function"
+	);
+}
+
+function composePanelNavigation(
+	editor: EditorComponent,
+	keybindings: KeybindingsManager,
+	openPanel: () => boolean | undefined,
+): EditorComponent {
+	if (!isCursorAwareEditor(editor)) return editor;
+	const handleInput = editor.handleInput.bind(editor);
+	editor.handleInput = (data: string) => {
+		const isDown = keybindings.matches(data, "tui.editor.cursorDown") || matchesKey(data, Key.down);
+		if (isDown && !editor.isShowingAutocomplete()) {
+			const cursor = editor.getCursor();
+			const lines = editor.getLines();
+			const lastLine = lines.length - 1;
+			if (cursor.line === lastLine && cursor.col === (lines[lastLine]?.length ?? 0) && openPanel()) return;
+		}
+		handleInput(data);
+	};
+	return editor;
+}
+
 const SpawnAgentSchema = Type.Object({
 	task: Type.String({ description: "Focused task to delegate to the subagent" }),
 	name: Type.Optional(Type.String({ description: "Readable subagent name" })),
 	cwd: Type.Optional(Type.String({ description: "Working directory, relative to the current agent unless absolute" })),
 	model: Type.Optional(Type.String({ description: "Exact model selector. Overrides configured and inherited defaults." })),
-	thinking: Type.Optional(Type.String({ description: "Thinking level for this subagent" })),
+	thinking: Type.Optional(
+		Type.String({ description: "Thinking level for this subagent", enum: [...THINKING_LEVEL_VALUES] }),
+	),
 	tools: Type.Optional(Type.Array(Type.String(), { description: "Optional exact tool allowlist" })),
 });
 
@@ -64,6 +104,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	let deliveryTimer: ReturnType<typeof setTimeout> | undefined;
 	let keepAlive: ReturnType<typeof setInterval> | undefined;
 	let inboxTimer: ReturnType<typeof setInterval> | undefined;
+	let previousEditorFactory: EditorFactory;
+	let installedEditorFactory: EditorFactory;
 
 	const modelLabel = (ctx: { model?: { provider: string; id: string } }): string | undefined =>
 		ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
@@ -179,33 +221,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 		mainModel = modelLabel(ctx);
 
-		class SubagentEditor extends CustomEditor {
-			private readonly keys: KeybindingsManager;
-
-			constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) {
-				super(tui, theme, keybindings);
-				this.keys = keybindings;
-			}
-
-			handleInput(data: string): void {
-				// Only steal Down when the cursor cannot move further down, so
-				// multiline editing and history navigation keep working.
-				if (!this.isShowingAutocomplete() && this.keys.matches(data, "tui.editor.cursorDown")) {
-					const cursor = this.getCursor();
-					const lines = this.getLines();
-					const lastLine = lines.length - 1;
-					if (cursor.line === lastLine && cursor.col === (lines[lastLine]?.length ?? 0) && panel?.open()) return;
-				} else if (matchesKey(data, Key.down) && !this.isShowingAutocomplete()) {
-					const cursor = this.getCursor();
-					const lines = this.getLines();
-					const lastLine = lines.length - 1;
-					if (cursor.line === lastLine && cursor.col === (lines[lastLine]?.length ?? 0) && panel?.open()) return;
-				}
-				super.handleInput(data);
-			}
-		}
-
-		let editor: SubagentEditor | undefined;
+		let editor: EditorComponent | undefined;
 		ctx.ui.setWidget(
 			"subagents",
 			(tui, theme) => {
@@ -227,11 +243,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			{ placement: "belowEditor" },
 		);
 
-		ctx.ui.setEditorComponent((tui, theme, keybindings) => {
-			editor = new SubagentEditor(tui, theme, keybindings);
+		previousEditorFactory = ctx.ui.getEditorComponent();
+		installedEditorFactory = (tui, theme, keybindings) => {
+			const baseEditor = previousEditorFactory?.(tui, theme, keybindings) ?? new CustomEditor(tui, theme, keybindings);
+			editor = composePanelNavigation(baseEditor, keybindings, () => panel?.open());
 			panel?.setEditor(editor);
 			return editor;
-		});
+		};
+		ctx.ui.setEditorComponent(installedEditorFactory);
 	});
 
 	pi.registerMessageRenderer("subagent-results", (message, _options, _theme) => {
@@ -289,7 +308,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	pi.on("session_shutdown", (_event, ctx) => {
 		panel?.dispose();
 		panel = undefined;
-		if (ctx.mode === "tui") ctx.ui.setWidget("subagents", undefined);
+		if (ctx.mode === "tui") {
+			ctx.ui.setWidget("subagents", undefined);
+			if (ctx.ui.getEditorComponent() === installedEditorFactory) {
+				ctx.ui.setEditorComponent(previousEditorFactory);
+			}
+			previousEditorFactory = undefined;
+			installedEditorFactory = undefined;
+		}
 		if (deliveryTimer) {
 			clearTimeout(deliveryTimer);
 			deliveryTimer = undefined;
@@ -355,7 +381,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					currentDepth: runtime.depth,
 					settings: runtime.settings,
 					parentModel,
-					parentThinking: ctx.thinkingLevel,
+					parentThinking: ctx.thinkingLevel ?? "off",
 					parentCwd: ctx.cwd,
 					projectTrusted: runtime.projectTrusted,
 					persistAfterSettled: ctx.mode === "tui" || ctx.mode === "rpc",
@@ -402,7 +428,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			return new Text(`${theme.fg("toolTitle", theme.bold("spawn_agent"))} ${theme.fg("accent", name)}${theme.fg("dim", model)}`, 0, 0);
 		},
 		renderResult(result, _options, theme) {
-			const record = result.details?.record;
+			const record = (result.details as { record?: AgentRecord } | undefined)?.record;
 			if (!record) {
 				const text = result.content[0];
 				return new Text(text?.type === "text" ? text.text : "", 0, 0);

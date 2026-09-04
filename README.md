@@ -112,7 +112,7 @@ cancel_subagent({ target: "auth-reviewer" })
 
 ## Configuration
 
-Global settings live at `~/.pi/agent/subagents.json`. A trusted project's `.pi/subagents.json` can override them for that project.
+Global settings live at `~/.pi/agent/subagents.json`. A trusted project's `<configDir>/subagents.json` (`.pi` by default; Pi's `CONFIG_DIR_NAME`) can override them for that project.
 
 ```json
 {

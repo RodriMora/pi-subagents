@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import type { SubagentSettings } from "./types.ts";
 
 export const DEFAULT_SETTINGS: SubagentSettings = {
@@ -7,7 +8,8 @@ export const DEFAULT_SETTINGS: SubagentSettings = {
 	maxConcurrency: 4,
 };
 
-const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+export const THINKING_LEVEL_VALUES = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const THINKING_LEVELS = new Set<string>(THINKING_LEVEL_VALUES);
 
 type RawSettings = Partial<SubagentSettings>;
 
@@ -45,13 +47,17 @@ function concurrency(value: unknown, field: string): number {
 	return value;
 }
 
+export function validateThinkingLevel(value: unknown, field: string): string {
+	const level = optionalString(value, field)!;
+	if (!THINKING_LEVELS.has(level)) throw new Error(`${field} is not a valid thinking level`);
+	return level;
+}
+
 function validate(raw: RawSettings, source: string): RawSettings {
 	const result: RawSettings = {};
 	if (raw.defaultModel !== undefined) result.defaultModel = optionalString(raw.defaultModel, `${source}.defaultModel`);
 	if (raw.defaultThinking !== undefined) {
-		const level = optionalString(raw.defaultThinking, `${source}.defaultThinking`)!;
-		if (!THINKING_LEVELS.has(level)) throw new Error(`${source}.defaultThinking is not a valid thinking level`);
-		result.defaultThinking = level;
+		result.defaultThinking = validateThinkingLevel(raw.defaultThinking, `${source}.defaultThinking`);
 	}
 	if (raw.maxDepth !== undefined) result.maxDepth = depth(raw.maxDepth, `${source}.maxDepth`);
 	if (raw.maxConcurrency !== undefined) {
@@ -75,18 +81,21 @@ export function loadSettings(options: {
 	const env = options.env ?? process.env;
 	const global = validate(readSettings(join(options.agentDir, "subagents.json")), "global subagent settings");
 	const project = options.projectTrusted
-		? validate(readSettings(join(options.cwd, ".pi", "subagents.json")), "project subagent settings")
+		? validate(readSettings(join(options.cwd, CONFIG_DIR_NAME, "subagents.json")), "project subagent settings")
 		: {};
 	const merged: SubagentSettings = { ...DEFAULT_SETTINGS, ...global, ...project };
 
 	const inheritedDepth = envNumber(env.PI_SUBAGENT_MAX_DEPTH, depth, "PI_SUBAGENT_MAX_DEPTH");
 	const flagDepth = options.depthFlag === undefined ? undefined : depth(Number(options.depthFlag), "--subagent-depth");
 	const configuredDepth = flagDepth ?? merged.maxDepth;
+	const envThinking = env.PI_SUBAGENT_DEFAULT_THINKING
+		? validateThinkingLevel(env.PI_SUBAGENT_DEFAULT_THINKING, "PI_SUBAGENT_DEFAULT_THINKING")
+		: undefined;
 
 	return {
 		...merged,
 		defaultModel: env.PI_SUBAGENT_DEFAULT_MODEL || merged.defaultModel,
-		defaultThinking: env.PI_SUBAGENT_DEFAULT_THINKING || merged.defaultThinking,
+		defaultThinking: envThinking ?? merged.defaultThinking,
 		// Descendants inherit the root's effective limit and can only tighten it.
 		maxDepth: inheritedDepth === undefined ? configuredDepth : Math.min(inheritedDepth, configuredDepth),
 		maxConcurrency: merged.maxConcurrency,
