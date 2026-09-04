@@ -159,6 +159,70 @@ function check(name, cond, extra) {
 		const thirdText = thirdCheck.content[0].text;
 		check("later check omits all delivered results", !thirdText.includes("first result") && !thirdText.includes("second result"), thirdText);
 		check("later check explains no new results", thirdText.includes("No new subagent results since the last check."), thirdText);
+
+		// A recursive result belongs to its direct parent, even when the root can inspect it.
+		registry.saveRecord(checkAgentDir, checkRecord("owner-child", "completed", { latestText: "child result" }));
+		registry.saveRecord(checkAgentDir, mk("owner-grand", "owner-child", {
+			rootRunId: "check-parent", depth: 2, status: "completed", latestText: "grandchild result",
+		}));
+		const rootOwnershipCheck = await checkTool.execute("check-owner-root", { wait: false }, undefined, undefined, {});
+		const rootOwnershipText = rootOwnershipCheck.content[0].text;
+		const afterRootOwnership = registry.readRecords(checkAgentDir);
+		check("root claims its direct child result", afterRootOwnership.find((r) => r.runId === "owner-child")?.resultsDelivered === true);
+		check("root does not claim grandchild result", afterRootOwnership.find((r) => r.runId === "owner-grand")?.resultsDelivered !== true);
+		check("root can inspect grandchild result read-only", rootOwnershipText.includes("grandchild result") && rootOwnershipText.includes("read-only descendant"), rootOwnershipText);
+
+		const childHandlers = new Map();
+		const childTools = new Map();
+		const childPi = {
+			...checkPi,
+			on: (event, handler) => childHandlers.set(event, handler),
+			registerTool: (tool) => childTools.set(tool.name, tool),
+		};
+		process.env.PI_SUBAGENT_RUN_ID = "owner-child";
+		process.env.PI_SUBAGENT_ROOT_ID = "check-parent";
+		subagentsExtension(childPi);
+		await childHandlers.get("session_start")({}, {
+			sessionManager: { getSessionId: () => "owner-child" },
+			cwd: sandbox,
+			isProjectTrusted: () => false,
+			mode: "rpc",
+			hasUI: false,
+		});
+		delete process.env.PI_SUBAGENT_RUN_ID;
+		delete process.env.PI_SUBAGENT_ROOT_ID;
+		const childOwnershipCheck = await childTools.get("check_subagents").execute("check-owner-child", { wait: false }, undefined, undefined, {});
+		check("child receives grandchild result", childOwnershipCheck.content[0].text.includes("grandchild result"), childOwnershipCheck.content[0].text);
+		check("child claims grandchild result", registry.readRecords(checkAgentDir).find((r) => r.runId === "owner-grand")?.resultsDelivered === true);
+		const rootAfterParentClaim = await checkTool.execute("check-owner-root-again", { wait: false }, undefined, undefined, {});
+		check("root omits grandchild after parent claims it", !rootAfterParentClaim.content[0].text.includes("grandchild result"), rootAfterParentClaim.content[0].text);
+
+		let automaticGrandchildMessages = 0;
+		childPi.sendMessage = async (message) => {
+			if (message.content.includes("automatic-grand")) automaticGrandchildMessages++;
+		};
+		registry.saveRecord(checkAgentDir, mk("automatic-grand", "owner-child", {
+			rootRunId: "check-parent", depth: 2, status: "thinking", latestText: "automatic grandchild result",
+		}));
+		await childTools.get("cancel_subagent").execute("cancel-automatic-grand", { target: "automatic-grand" }, undefined, undefined, {});
+		for (let i = 0; i < 100 && automaticGrandchildMessages < 1; i++) await new Promise((r) => setTimeout(r, 25));
+		check("automatic grandchild delivery reaches direct parent", automaticGrandchildMessages === 1, String(automaticGrandchildMessages));
+		check("automatic grandchild delivery is claimed by direct parent", registry.readRecords(checkAgentDir).find((r) => r.runId === "automatic-grand")?.resultsDelivered === true);
+		childHandlers.get("session_shutdown")?.({}, { mode: "rpc" });
+
+		// A failed automatic send leaves the result pending and schedules another attempt.
+		let automaticSendAttempts = 0;
+		checkPi.sendMessage = () => {
+			automaticSendAttempts++;
+			if (automaticSendAttempts === 1) throw new Error("temporary send failure");
+		};
+		registry.saveRecord(checkAgentDir, checkRecord("retry-child", "thinking"));
+		await checkTools.get("cancel_subagent").execute("cancel-retry", { target: "retry-child" }, undefined, undefined, {});
+		for (let i = 0; i < 100 && automaticSendAttempts < 1; i++) await new Promise((r) => setTimeout(r, 25));
+		check("failed automatic send leaves result unclaimed", registry.readRecords(checkAgentDir).find((r) => r.runId === "retry-child")?.resultsDelivered !== true);
+		for (let i = 0; i < 100 && automaticSendAttempts < 2; i++) await new Promise((r) => setTimeout(r, 25));
+		check("failed automatic send is retried", automaticSendAttempts >= 2, String(automaticSendAttempts));
+		check("successful automatic retry claims result", registry.readRecords(checkAgentDir).find((r) => r.runId === "retry-child")?.resultsDelivered === true);
 	} finally {
 		checkHandlers.get("session_shutdown")?.({}, { mode: "rpc" });
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
