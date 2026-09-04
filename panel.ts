@@ -10,6 +10,8 @@ import {
 	type Focusable,
 	type OverlayHandle,
 	type TUI,
+	type TuiMouseEvent,
+	type TuiMouseEventResult,
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
@@ -197,6 +199,10 @@ export class SubagentPanel implements Component, Focusable {
 		return this.reviewing ? this.records : this.visible;
 	}
 
+	private selectedRecord(): AgentRecord | undefined {
+		return this.rows()[this.selected];
+	}
+
 	private close(): void {
 		this.detail = false;
 		this.messageInput.focused = false;
@@ -273,16 +279,29 @@ export class SubagentPanel implements Component, Focusable {
 		if (this.focused && rows.length === 0) this.close();
 	}
 
+	private scrollByWheel(delta: number): boolean {
+		if (!Number.isFinite(delta) || delta === 0) return false;
+		const previous = this.scrollOffset;
+		this.scrollOffset = Math.max(0, this.scrollOffset - Math.sign(delta) * SCROLL_STEP);
+		return this.scrollOffset !== previous;
+	}
+
 	private handleWheel(data: string): boolean {
 		const match = /^\x1b\[<(\d+);(\d+);(\d+)[Mm]$/.exec(data);
 		if (!match) return false;
 		const button = Number(match[1]);
 		if (!Number.isFinite(button) || (button & 64) === 0) return false;
 		const direction = button & 3;
-		if (direction === 0) this.scrollOffset += SCROLL_STEP;
-		else if (direction === 1) this.scrollOffset = Math.max(0, this.scrollOffset - SCROLL_STEP);
+		if (direction === 0) this.scrollByWheel(-1);
+		else if (direction === 1) this.scrollByWheel(1);
+		else return false;
 		this.tui.requestRender();
 		return true;
+	}
+
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (!this.detail || event.type !== "wheel" || !event.wheelDelta) return undefined;
+		return { handled: true, render: this.scrollByWheel(event.wheelDelta) };
 	}
 
 	handleInput(data: string): void {
@@ -414,7 +433,7 @@ export class SubagentPanel implements Component, Focusable {
 			if (now - this.lastDiscover > 2000) {
 				this.lastDiscover = now;
 				void discoverSessionFile(record.cwd, record.sessionId).then((found) => {
-					if (found && this.records[this.selected]?.runId === record.runId) {
+					if (found && this.selectedRecord()?.runId === record.runId) {
 						this.transcriptFile = found;
 						this.tui.requestRender();
 					}
@@ -538,6 +557,10 @@ class SubagentDetailOverlay implements Component, Focusable {
 
 	handleInput(data: string): void {
 		this.panel.handleInput(data);
+	}
+
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		return this.panel.handleMouse(event);
 	}
 
 	render(width: number): string[] {
