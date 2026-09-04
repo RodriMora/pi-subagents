@@ -2,11 +2,13 @@ import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
+	Input,
 	Key,
 	matchesKey,
 	truncateToWidth,
 	type Component,
 	type Focusable,
+	type OverlayHandle,
 	type TUI,
 	visibleWidth,
 	wrapTextWithAnsi,
@@ -18,6 +20,13 @@ import type { AgentRecord } from "./types.ts";
 const MAX_FOOTER_ROWS = 8;
 const MAX_TRANSCRIPT_LINES = 150;
 const SCROLL_STEP = 5;
+const SCROLL_PAGE = 20;
+const OVERLAY_MARGIN = 1;
+
+interface SubagentPanelOptions {
+	onMessage?: (record: AgentRecord, text: string) => Promise<void>;
+	onCancel?: (record: AgentRecord) => void;
+}
 
 function shortPath(path: string): string {
 	const home = homedir();
@@ -66,7 +75,7 @@ function clean(line: string): string {
 }
 
 export class SubagentPanel implements Component, Focusable {
-	focused = false;
+	private _focused = false;
 	private records: AgentRecord[] = [];
 	private visible: AgentRecord[] = [];
 	private selected = 0;
@@ -79,14 +88,47 @@ export class SubagentPanel implements Component, Focusable {
 	private lastDiscover = 0;
 	private scrollOffset = 0;
 	private detailRunId?: string;
+	private messageInput = new Input();
+	private messageStatus?: string;
+	private detailOverlay?: SubagentDetailOverlay;
+	private overlayHandle?: OverlayHandle;
 	private timer: ReturnType<typeof setInterval>;
+
+	get focused(): boolean {
+		return this._focused;
+	}
+
+	set focused(value: boolean) {
+		this._focused = value;
+		this.messageInput.focused = value && this.detail;
+	}
 
 	constructor(
 		private readonly tui: TUI,
 		private theme: Theme,
 		private readonly agentDir: string,
 		private readonly currentRunId: string,
+		private readonly options: SubagentPanelOptions = {},
 	) {
+		this.messageInput.onSubmit = (value) => {
+			const text = value.trim();
+			const record = this.rows()[this.selected];
+			if (!text || !record || !this.options.onMessage) return;
+			this.messageInput.setValue("");
+			this.scrollOffset = 0;
+			this.messageStatus = "sending…";
+			this.tui.requestRender();
+			void this.options.onMessage(record, text).then(
+				() => {
+					this.messageStatus = "sent";
+					this.tui.requestRender();
+				},
+				(error) => {
+					this.messageStatus = error instanceof Error ? error.message : String(error);
+					this.tui.requestRender();
+				},
+			);
+		};
 		this.refresh();
 		this.timer = setInterval(() => {
 			const before = JSON.stringify(this.records);
@@ -127,6 +169,7 @@ export class SubagentPanel implements Component, Focusable {
 
 	/** Down-arrow entry: only non-dismissed subagents. */
 	open(): boolean {
+		if (this.overlayHandle) this.closeDetail();
 		this.refresh();
 		if (this.visible.length === 0) return false;
 		this.reviewing = false;
@@ -139,6 +182,7 @@ export class SubagentPanel implements Component, Focusable {
 
 	/** /subagents entry: full history including dismissed. */
 	openReview(): boolean {
+		if (this.overlayHandle) this.closeDetail();
 		this.refresh();
 		if (this.records.length === 0) return false;
 		this.reviewing = true;
@@ -155,9 +199,68 @@ export class SubagentPanel implements Component, Focusable {
 
 	private close(): void {
 		this.detail = false;
+		this.messageInput.focused = false;
 		this.reviewing = false;
 		this.tui.setFocus(this.editor ?? null);
 		this.tui.requestRender();
+	}
+
+	private openDetail(): void {
+		if (this.rows().length === 0) return;
+		this.detail = true;
+		this.messageStatus = undefined;
+		this.scrollOffset = 0;
+
+		// A focused overlay is important here: Pi's fullscreen TUI otherwise
+		// consumes page keys and mouse-wheel events for the main conversation
+		// before they reach this widget.
+		const showOverlay = (this.tui as TUI & { showOverlay?: TUI["showOverlay"] }).showOverlay;
+		if (typeof showOverlay === "function") {
+			const overlay = new SubagentDetailOverlay(this);
+			this.detailOverlay = overlay;
+			this.overlayHandle = showOverlay.call(this.tui, overlay, {
+				width: "100%",
+				maxHeight: "100%",
+				anchor: "center",
+				margin: OVERLAY_MARGIN,
+			});
+		} else {
+			// Keeps lightweight callers/tests that provide only the old TUI subset
+			// usable; real Pi always has showOverlay().
+			this.messageInput.focused = true;
+		}
+		this.tui.requestRender();
+	}
+
+	private closeDetail(): void {
+		this.detail = false;
+		this.messageInput.focused = false;
+		this.scrollOffset = 0;
+		const handle = this.overlayHandle;
+		this.overlayHandle = undefined;
+		this.detailOverlay = undefined;
+		if (handle) {
+			handle.hide();
+		} else {
+			this.tui.setFocus(this);
+		}
+		this.tui.requestRender();
+	}
+
+	/** Called by the overlay wrapper so the embedded editor keeps IME focus. */
+	setDetailInputFocused(value: boolean): void {
+		this.messageInput.focused = value && this.detail;
+	}
+
+	private detailMaxHeight(): number {
+		const rows = this.tui.terminal?.rows;
+		return typeof rows === "number" && Number.isFinite(rows)
+			? Math.max(1, rows - OVERLAY_MARGIN * 2)
+			: MAX_TRANSCRIPT_LINES + 8;
+	}
+
+	renderDetailForOverlay(width: number): string[] {
+		return this.renderDetail(width, this.detailMaxHeight());
 	}
 
 	private refresh(): void {
@@ -170,40 +273,53 @@ export class SubagentPanel implements Component, Focusable {
 		if (this.focused && rows.length === 0) this.close();
 	}
 
+	private handleWheel(data: string): boolean {
+		const match = /^\x1b\[<(\d+);(\d+);(\d+)[Mm]$/.exec(data);
+		if (!match) return false;
+		const button = Number(match[1]);
+		if (!Number.isFinite(button) || (button & 64) === 0) return false;
+		const direction = button & 3;
+		if (direction === 0) this.scrollOffset += SCROLL_STEP;
+		else if (direction === 1) this.scrollOffset = Math.max(0, this.scrollOffset - SCROLL_STEP);
+		this.tui.requestRender();
+		return true;
+	}
+
 	handleInput(data: string): void {
 		// Left arrow (Esc as an alias) always goes back one level:
 		// detail -> list -> editor.
-		if (matchesKey(data, Key.left) || matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
-			if (this.detail) {
-				this.detail = false;
-				this.scrollOffset = 0;
-				this.tui.requestRender();
-			} else {
-				this.close();
-			}
+		if (
+			matchesKey(data, Key.escape) ||
+			matchesKey(data, Key.ctrl("c")) ||
+			(matchesKey(data, Key.left) && (!this.detail || this.messageInput.getValue().length === 0))
+		) {
+			if (this.detail) this.closeDetail();
+			else this.close();
 			return;
 		}
 		if (this.detail) {
-			if (matchesKey(data, Key.enter)) {
-				this.detail = false;
-				this.scrollOffset = 0;
-				this.tui.requestRender();
-			} else if (matchesKey(data, Key.up)) {
-				this.scrollOffset = Math.min(this.scrollOffset + SCROLL_STEP, 10000);
+			if (this.handleWheel(data)) return;
+			if (matchesKey(data, Key.up)) {
+				this.scrollOffset += SCROLL_STEP;
 				this.tui.requestRender();
 			} else if (matchesKey(data, Key.down)) {
 				this.scrollOffset = Math.max(0, this.scrollOffset - SCROLL_STEP);
+				this.tui.requestRender();
+			} else if (matchesKey(data, Key.pageUp)) {
+				this.scrollOffset += SCROLL_PAGE;
+				this.tui.requestRender();
+			} else if (matchesKey(data, Key.pageDown)) {
+				this.scrollOffset = Math.max(0, this.scrollOffset - SCROLL_PAGE);
+				this.tui.requestRender();
+			} else {
+				this.messageInput.handleInput(data);
 				this.tui.requestRender();
 			}
 			return;
 		}
 		// Enter or Right arrow opens the selected subagent.
 		if (matchesKey(data, Key.enter) || matchesKey(data, Key.right)) {
-			if (this.rows().length > 0) {
-				this.detail = true;
-				this.scrollOffset = 0;
-				this.tui.requestRender();
-			}
+			this.openDetail();
 			return;
 		}
 		if (matchesKey(data, Key.up)) {
@@ -215,12 +331,18 @@ export class SubagentPanel implements Component, Focusable {
 		if (matchesKey(data, Key.down)) {
 			this.selected = Math.min(this.rows().length - 1, this.selected + 1);
 			this.tui.requestRender();
+			return;
+		}
+		if (data === "x") {
+			const record = this.rows()[this.selected];
+			if (record && !isTerminal(record)) this.options.onCancel?.(record);
+			this.tui.requestRender();
 		}
 	}
 
 	render(width: number): string[] {
 		this.refresh();
-		if (this.focused && this.detail) return this.renderDetail(width);
+		if (this.focused && this.detail && !this.overlayHandle) return this.renderDetail(width);
 		return this.renderTree(width);
 	}
 
@@ -281,7 +403,7 @@ export class SubagentPanel implements Component, Focusable {
 		if (start + window.length < rows.length) {
 			lines.push(this.theme.fg("dim", `… +${rows.length - start - window.length} more`));
 		}
-		lines.push(this.theme.fg("dim", this.focused ? "↑/↓ select   Enter/→ open   ← back" : "↓ inspect"));
+		lines.push(this.theme.fg("dim", this.focused ? "↑/↓ select   Enter/→ open   x stop   ← back" : "↓ inspect"));
 		return lines.map((line) => truncateToWidth(line, width, ""));
 	}
 
@@ -330,42 +452,99 @@ export class SubagentPanel implements Component, Focusable {
 		return lines;
 	}
 
-	private renderDetail(width: number): string[] {
+	private renderDetail(width: number, maxHeight = MAX_TRANSCRIPT_LINES + 8): string[] {
 		const record = this.rows()[this.selected];
 		if (!record) return [];
 		if (this.detailRunId !== record.runId) {
 			this.detailRunId = record.runId;
 			this.scrollOffset = 0;
 			this.transcript = null;
+			this.transcriptFile = undefined;
 		}
 		const icon = this.theme.fg(statusColor(record), statusIcon(record));
-		const lines = [
+		const header = [
 			truncateToWidth(`${icon} ${this.theme.bold(record.name)} ${this.theme.fg("dim", `· ${record.status} · ${elapsed(record)}`)}`, width),
 			this.theme.fg("dim", `${record.model}${record.thinking !== "off" ? `:${record.thinking}` : ""} · depth ${record.depth}/${record.maxDepth} · ${shortPath(record.cwd)}`),
 			"",
 		];
+		const footer = [
+			"",
+			...(this.messageStatus
+				? [this.theme.fg(this.messageStatus === "sent" || this.messageStatus === "sending…" ? "dim" : "error", this.messageStatus)]
+				: []),
+			this.theme.fg("muted", "Message this subagent:"),
+			...this.messageInput.render(width),
+			this.theme.fg("dim", "Enter send   ↑/↓/PgUp/PgDn scroll   Esc back"),
+		];
+		const available = Math.max(1, maxHeight - header.length - footer.length);
+		const lines = [...header];
 		const components = this.transcriptComponents(record);
 		if (!components || components.length === 0) {
-			lines.push(...this.legacyDetail(record, width));
+			lines.push(...this.legacyDetail(record, width).slice(0, available));
 		} else {
 			const body: string[] = [];
 			for (const component of components) {
 				for (const line of component.render(width)) body.push(clean(line));
 			}
-			const total = body.length;
-			const end = Math.max(0, total - this.scrollOffset);
-			const start = Math.max(0, end - MAX_TRANSCRIPT_LINES);
-			if (start > 0) lines.push(this.theme.fg("dim", `… ${start} earlier lines · ↑ scroll`));
-			lines.push(...body.slice(start, end));
-			if (this.scrollOffset > 0) lines.push(this.theme.fg("dim", `… ${total - end} newer lines · ↓ follow`));
+			if (record.activity === "responding" && record.latestText) {
+				body.push("", this.theme.fg("dim", "live"), ...wrapTextWithAnsi(record.latestText, Math.max(1, width)));
+			}
+			const bodyViewport = Math.max(1, available - 2);
+			this.scrollOffset = Math.min(this.scrollOffset, Math.max(0, body.length - bodyViewport));
+			const end = Math.max(0, body.length - this.scrollOffset);
+			const start = Math.max(0, end - bodyViewport);
+			const content: string[] = [];
+			if (start > 0) content.push(this.theme.fg("dim", `… ${start} earlier lines · ↑/PgUp scroll`));
+			content.push(...body.slice(start, end));
+			if (this.scrollOffset > 0) content.push(this.theme.fg("dim", `… ${body.length - end} newer lines · ↓/PgDn follow`));
+			lines.push(...content.slice(0, available));
 		}
-		lines.push("", this.theme.fg("dim", "↑/↓ scroll   ← back"));
-		return lines.map((line) => truncateToWidth(line, width, ""));
+		lines.push(...footer);
+		return lines.slice(0, maxHeight).map((line) => truncateToWidth(line, width, ""));
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		this.messageInput.invalidate();
+	}
 
 	dispose(): void {
+		this.detail = false;
+		this.messageInput.focused = false;
+		this.overlayHandle?.hide();
+		this.overlayHandle = undefined;
+		this.detailOverlay = undefined;
 		clearInterval(this.timer);
+	}
+}
+
+/**
+ * Focus target used by the transcript overlay. The persistent panel remains a
+ * below-editor widget; this wrapper lets Pi's viewport defer page/mouse scroll
+ * events while the transcript is open.
+ */
+class SubagentDetailOverlay implements Component, Focusable {
+	private _focused = false;
+
+	get focused(): boolean {
+		return this._focused;
+	}
+
+	set focused(value: boolean) {
+		this._focused = value;
+		this.panel.setDetailInputFocused(value);
+	}
+
+	constructor(private readonly panel: SubagentPanel) {}
+
+	handleInput(data: string): void {
+		this.panel.handleInput(data);
+	}
+
+	render(width: number): string[] {
+		return this.panel.renderDetailForOverlay(width);
+	}
+
+	invalidate(): void {
+		this.panel.invalidate();
 	}
 }

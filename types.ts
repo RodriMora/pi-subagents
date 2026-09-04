@@ -30,6 +30,7 @@ export interface AgentRecord {
 	cwd: string;
 	model: string;
 	thinking: string;
+	tools?: string[];
 	depth: number;
 	maxDepth: number;
 	status: AgentStatus;

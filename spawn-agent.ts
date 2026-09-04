@@ -1,15 +1,13 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { applyChildEvent, toolUsage, type ParsedChildState } from "./events.ts";
-import { isProcessAlive, readRecords, saveRecord } from "./registry.ts";
+import { applyChildEvent, type ParsedChildState } from "./events.ts";
+import { descendantsOf, isProcessAlive, isTerminalStatus, readRecords, saveRecord } from "./registry.ts";
 import { EMPTY_USAGE, type AgentRecord, type SpawnAgentInput, type SubagentSettings } from "./types.ts";
 
 const STDERR_LIMIT = 4000;
-const OUTPUT_LIMIT = 50 * 1024;
 
 export class ConcurrencyGate {
 	private running = 0;
@@ -64,6 +62,23 @@ export class ConcurrencyGate {
 
 export const gate = new ConcurrencyGate();
 
+interface LiveChild {
+	sendMessage(message: string): Promise<void>;
+}
+
+const liveChildren = new Map<string, LiveChild>();
+const startingChildren = new Map<string, Promise<LiveChild | null>>();
+const resolveStarting = new Map<string, (child: LiveChild | null) => void>();
+
+/** Send directly when this process owns the target child. */
+export async function sendSubagentMessage(record: AgentRecord, message: string): Promise<boolean> {
+	const startup = startingChildren.get(record.runId);
+	const live = startup ? await startup : liveChildren.get(record.runId);
+	if (!live) return false;
+	await live.sendMessage(message);
+	return true;
+}
+
 export interface SpawnContext {
 	agentDir: string;
 	parentRunId: string;
@@ -74,8 +89,10 @@ export interface SpawnContext {
 	parentThinking: string;
 	parentCwd: string;
 	projectTrusted: boolean;
+	persistAfterSettled?: boolean;
 	signal?: AbortSignal;
 	onRecord?: (record: AgentRecord) => void;
+	onUiRequest?: (record: AgentRecord, request: any) => Promise<Record<string, unknown> | void>;
 	/** Fired once per child when it reaches a terminal state. */
 	onSettled?: (record: AgentRecord) => void;
 }
@@ -113,14 +130,6 @@ function ensureDirectory(value: string): string {
 	return cwd;
 }
 
-function boundedOutput(text: string): string {
-	const bytes = Buffer.byteLength(text, "utf8");
-	if (bytes <= OUTPUT_LIMIT) return text;
-	let result = text.slice(-OUTPUT_LIMIT);
-	while (Buffer.byteLength(result, "utf8") > OUTPUT_LIMIT) result = result.slice(1);
-	return `[Earlier output omitted; full transcript remains in the child session.]\n\n${result}`;
-}
-
 export function killPidTree(pid: number): void {
 	if (process.platform === "win32") {
 		spawn("taskkill", ["/pid", String(pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
@@ -148,19 +157,25 @@ export function killPidTree(pid: number): void {
 	}, 3000).unref();
 }
 
-/** Force-cancel a running or queued child: kill its process tree and persist the state. */
+/** Force-cancel a running or queued child and all of its descendants. */
 export function cancelSubagent(agentDir: string, record: AgentRecord): AgentRecord {
-	if (record.pid && isProcessAlive(record.pid)) killPidTree(record.pid);
-	const updated: AgentRecord = {
-		...record,
-		status: "cancelled",
-		activity: "cancelled",
-		error: record.error ?? "Cancelled",
-		finishedAt: record.finishedAt ?? new Date().toISOString(),
-		updatedAt: new Date().toISOString(),
+	const cancelOne = (item: AgentRecord): AgentRecord => {
+		if (item.pid && isProcessAlive(item.pid)) killPidTree(item.pid);
+		const updated: AgentRecord = {
+			...item,
+			status: "cancelled",
+			activity: "cancelled",
+			error: item.error ?? "Cancelled",
+			finishedAt: item.finishedAt ?? new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
+		};
+		saveRecord(agentDir, updated);
+		return updated;
 	};
-	saveRecord(agentDir, updated);
-	return updated;
+	for (const child of descendantsOf(readRecords(agentDir), record.runId).reverse()) {
+		if (!isTerminalStatus(child.status)) cancelOne(child);
+	}
+	return cancelOne(record);
 }
 
 async function findSessionFile(cwd: string, sessionId: string): Promise<string | undefined> {
@@ -198,10 +213,11 @@ export async function startSubagent(input: SpawnAgentInput, context: SpawnContex
 		rootRunId: context.rootRunId,
 		sessionId: runId,
 		name: compactName(input),
-		task: input.task.slice(0, 1000),
+		task: input.task,
 		cwd,
 		model,
 		thinking,
+		tools: input.tools,
 		depth: context.currentDepth + 1,
 		maxDepth: context.settings.maxDepth,
 		status: queued ? "queued" : "starting",
@@ -213,17 +229,24 @@ export async function startSubagent(input: SpawnAgentInput, context: SpawnContex
 	saveRecord(context.agentDir, record);
 	context.onRecord?.(record);
 
-	void runSubagentProcess(input, context, record).catch((error) => {
-		if (record.status === "cancelled") return;
-		record.status = "failed";
-		record.activity = "failed";
-		record.error = error instanceof Error ? error.message : String(error);
-		record.finishedAt = record.finishedAt ?? new Date().toISOString();
-		record.updatedAt = record.finishedAt;
-		saveRecord(context.agentDir, record);
-		context.onRecord?.(record);
-		context.onSettled?.(record);
-	});
+	startingChildren.set(record.runId, new Promise((resolveChild) => resolveStarting.set(record.runId, resolveChild)));
+	void runSubagentProcess(input, context, record)
+		.catch((error) => {
+			if (isTerminalStatus(record.status)) return;
+			record.status = "failed";
+			record.activity = "failed";
+			record.error = error instanceof Error ? error.message : String(error);
+			record.finishedAt = record.finishedAt ?? new Date().toISOString();
+			record.updatedAt = record.finishedAt;
+			saveRecord(context.agentDir, record);
+			context.onRecord?.(record);
+			context.onSettled?.(record);
+		})
+		.finally(() => {
+			resolveStarting.get(record.runId)?.(isTerminalStatus(record.status) ? null : liveChildren.get(record.runId) ?? null);
+			resolveStarting.delete(record.runId);
+			startingChildren.delete(record.runId);
+		});
 	return record;
 }
 
@@ -232,7 +255,6 @@ async function runSubagentProcess(
 	context: SpawnContext,
 	record: AgentRecord,
 ): Promise<void> {
-	let promptDir: string | null = null;
 	let release: (() => void) | undefined;
 	let flushTimer: ReturnType<typeof setTimeout> | undefined;
 	const publish = () => {
@@ -259,8 +281,9 @@ async function runSubagentProcess(
 	const settle = (status: AgentRecord["status"], detail?: string) => {
 		record.status = status;
 		record.activity = status;
+		record.currentTool = undefined;
 		if (detail) record.error = detail;
-		record.finishedAt = record.finishedAt ?? new Date().toISOString();
+		record.finishedAt = new Date().toISOString();
 		record.updatedAt = record.finishedAt;
 		publish();
 		context.onSettled?.(record);
@@ -268,37 +291,45 @@ async function runSubagentProcess(
 
 	try {
 		release = await gate.acquire(context.settings.maxConcurrency);
-		// A cancel may have landed while this child waited for a slot; the disk
-		// record is authoritative because cancelSubagent runs in a different copy.
 		if (record.status === "cancelled" || diskCancelled()) return;
 
-		const promptDirCreated = mkdtempSync(join(tmpdir(), "pi-subagent-"));
-		promptDir = promptDirCreated;
-		const promptPath = join(promptDirCreated, "task.md");
-		writeFileSync(
-			promptPath,
-			`You are subagent "${record.name}" at depth ${record.depth}/${record.maxDepth}. Complete this delegated task and return a concise, self-contained result.\n\n${input.task}\n`,
-			{ encoding: "utf8", mode: 0o600 },
-		);
-
-		const args = ["--mode", "json", "-p", "--session-id", record.runId, "--name", record.name, "--model", record.model];
+		const systemPrompt = `You are subagent "${record.name}" at depth ${record.depth}/${record.maxDepth}. Complete delegated tasks and return concise, self-contained results.`;
+		const args = [
+			"--mode",
+			"rpc",
+			"--session-id",
+			record.runId,
+			"--name",
+			record.name,
+			"--model",
+			record.model,
+			"--append-system-prompt",
+			systemPrompt,
+		];
 		if (record.thinking) args.push("--thinking", record.thinking);
 		if (input.tools?.length) args.push("--tools", input.tools.join(","));
 		if (context.projectTrusted && (record.cwd === context.parentCwd || record.cwd.startsWith(`${context.parentCwd}/`))) {
 			args.push("--approve");
 		}
-		args.push(`@${promptPath}`);
 
 		let stderr = "";
 		let buffer = "";
+		let requestId = 0;
+		let initialSettled = false;
+		let resolveInitial!: () => void;
+		const initialDone = new Promise<void>((resolveDone) => {
+			resolveInitial = resolveDone;
+		});
 		const state: ParsedChildState = { finalText: "" };
+		const pending = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void }>();
+		const continuationReleases: Array<() => void> = [];
 
 		const invocation = getPiInvocation(args);
 		const child = spawn(invocation.command, invocation.args, {
 			cwd: record.cwd,
 			detached: process.platform !== "win32",
 			shell: false,
-			stdio: ["ignore", "pipe", "pipe"],
+			stdio: ["pipe", "pipe", "pipe"],
 			env: {
 				...process.env,
 				PI_SUBAGENT_RUN_ID: record.runId,
@@ -313,61 +344,150 @@ async function runSubagentProcess(
 		record.activity = "starting";
 		publish();
 
+		const send = (command: Record<string, unknown>): Promise<any> => {
+			const id = `subagent-${++requestId}`;
+			return new Promise((resolveCommand, rejectCommand) => {
+				pending.set(id, { resolve: resolveCommand, reject: rejectCommand });
+				if (!child.stdin.write(`${JSON.stringify({ ...command, id })}\n`)) {
+					child.stdin.once("drain", () => {});
+				}
+			});
+		};
+
+		const liveChild: LiveChild = {
+			async sendMessage(message: string) {
+				const followUp = isTerminalStatus(record.status);
+				const releaseTurn = followUp ? await gate.acquire(context.settings.maxConcurrency) : undefined;
+				if (releaseTurn) continuationReleases.push(releaseTurn);
+				try {
+					await send({
+						type: "prompt",
+						message,
+						...(followUp ? {} : { streamingBehavior: "steer" }),
+					});
+				} catch (error) {
+					if (releaseTurn) {
+						const index = continuationReleases.indexOf(releaseTurn);
+						if (index >= 0) continuationReleases.splice(index, 1);
+						releaseTurn();
+					}
+					throw error;
+				}
+			},
+		};
+		liveChildren.set(record.runId, liveChild);
+
 		const processLine = (line: string) => {
 			if (!line.trim()) return;
+			let event: any;
 			try {
-				const important = applyChildEvent(record, state, JSON.parse(line));
-				schedulePublish(important);
+				event = JSON.parse(line);
 			} catch {
-				// Ignore non-JSON diagnostics on stdout.
+				return;
 			}
+			if (event.type === "response" && typeof event.id === "string") {
+				const request = pending.get(event.id);
+				if (!request) return;
+				pending.delete(event.id);
+				if (event.success) request.resolve(event);
+				else request.reject(new Error(event.error || `${event.command || "RPC command"} failed`));
+				return;
+			}
+			if (event.type === "extension_ui_request" && typeof event.id === "string") {
+				const dialog = ["select", "confirm", "input", "editor"].includes(event.method);
+				if (context.onUiRequest) {
+					void context.onUiRequest(record, event).then(
+						(response) => {
+							if (dialog) child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: event.id, ...(response ?? { cancelled: true }) })}\n`);
+						},
+						() => {
+							if (dialog) child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: event.id, cancelled: true })}\n`);
+						},
+					);
+				} else if (dialog) {
+					child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: event.id, cancelled: true })}\n`);
+				}
+				return;
+			}
+			const important = applyChildEvent(record, state, event);
+			if (event.type === "agent_settled") {
+				if (initialSettled) continuationReleases.shift()?.();
+				if (record.status === "cancelled" || diskCancelled()) {
+					const onDisk = readRecords(context.agentDir).find((r) => r.runId === record.runId);
+					if (onDisk) Object.assign(record, onDisk);
+				} else if (state.stopReason === "aborted") {
+					settle("cancelled", "Subagent was aborted");
+				} else if (state.stopReason === "error") {
+					settle("failed", state.errorMessage || stderr.trim() || "Subagent failed");
+				} else {
+					record.latestText = state.finalText || record.latestText || "(no output)";
+					settle("completed");
+				}
+				if (!initialSettled) {
+					initialSettled = true;
+					resolveInitial();
+				}
+				if (context.persistAfterSettled === false) child.stdin.end();
+				return;
+			}
+			schedulePublish(important);
 		};
+
 		child.stdout.on("data", (chunk) => {
 			buffer += chunk.toString();
-			const lines = buffer.split("\n");
-			buffer = lines.pop() ?? "";
-			for (const line of lines) processLine(line);
+			while (true) {
+				const newline = buffer.indexOf("\n");
+				if (newline < 0) break;
+				let line = buffer.slice(0, newline);
+				buffer = buffer.slice(newline + 1);
+				if (line.endsWith("\r")) line = line.slice(0, -1);
+				processLine(line);
+			}
 		});
 		child.stderr.on("data", (chunk) => {
 			stderr = `${stderr}${chunk.toString()}`.slice(-STDERR_LIMIT);
 		});
-
-		const exitCode = await new Promise<number>((resolveExit) => {
-			child.on("close", (code) => resolveExit(code ?? 1));
-			child.on("error", (error) => {
-				stderr = `${stderr}\n${error.message}`.slice(-STDERR_LIMIT);
-				resolveExit(1);
-			});
+		child.stdin.on("error", () => {});
+		child.on("close", (code) => {
+			liveChildren.delete(record.runId);
+			for (const releaseTurn of continuationReleases.splice(0)) releaseTurn();
+			if (buffer.trim()) processLine(buffer);
+			for (const request of pending.values()) request.reject(new Error(stderr.trim() || `Subagent exited with code ${code ?? 1}`));
+			pending.clear();
+			const wasCancelled = record.status === "cancelled" || diskCancelled();
+			record.pid = undefined;
+			if (!wasCancelled && !isTerminalStatus(record.status)) {
+				settle("failed", stderr.trim() || `Subagent exited with code ${code ?? 1}`);
+			}
+			if (!initialSettled) {
+				initialSettled = true;
+				resolveInitial();
+			}
 		});
-		if (buffer.trim()) processLine(buffer);
-		if (flushTimer) {
-			clearTimeout(flushTimer);
-			flushTimer = undefined;
-		}
-		record.sessionFile = await findSessionFile(record.cwd, record.runId);
+		child.on("error", (error) => {
+			stderr = `${stderr}\n${error.message}`.slice(-STDERR_LIMIT);
+		});
 
-		if (record.status === "cancelled" || diskCancelled()) {
-			// cancelSubagent owns the terminal state; never overwrite it with
-			// a failure just because the killed process exited non-zero.
-			const onDisk = readRecords(context.agentDir).find((r) => r.runId === record.runId);
-			if (onDisk) Object.assign(record, onDisk);
-			context.onSettled?.(record);
-			return;
+		try {
+			const stateResponse = await send({ type: "get_state" });
+			if (typeof stateResponse.data?.sessionFile === "string") {
+				record.sessionFile = stateResponse.data.sessionFile;
+				publish();
+			} else {
+				record.sessionFile = await findSessionFile(record.cwd, record.runId);
+			}
+			await send({ type: "prompt", message: input.task });
+			resolveStarting.get(record.runId)?.(liveChild);
+			await initialDone;
+		} catch (error) {
+			child.stdin.end();
+			setTimeout(() => {
+				if (record.pid && isProcessAlive(record.pid)) killPidTree(record.pid);
+			}, 1000).unref();
+			throw error;
 		}
-		if (state.stopReason === "aborted") {
-			settle("cancelled", "Subagent was aborted");
-			return;
-		}
-		if (exitCode !== 0 || state.stopReason === "error") {
-			settle("failed", state.errorMessage || stderr.trim() || `Subagent exited with code ${exitCode}`);
-			return;
-		}
-		record.latestText = state.finalText || record.latestText || "(no output)";
-		settle("completed");
-		void boundedOutput;
 	} finally {
 		if (flushTimer) clearTimeout(flushTimer);
-		if (promptDir) rmSync(promptDir, { recursive: true, force: true });
 		release?.();
 	}
 }

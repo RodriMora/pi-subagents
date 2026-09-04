@@ -1,16 +1,11 @@
-import { readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import {
 	AssistantMessageComponent,
 	SessionManager,
 	ToolExecutionComponent,
 	UserMessageComponent,
-	buildContextEntries,
-	parseSessionEntries,
-	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import { Text, type Component, type TUI } from "@earendil-works/pi-tui";
-
-const MAX_MESSAGES = 60;
 
 export async function discoverSessionFile(cwd: string, sessionId: string): Promise<string | undefined> {
 	try {
@@ -36,51 +31,44 @@ function hasVisibleAssistantContent(message: any): boolean {
 	);
 }
 
-function toMessages(entries: any[]): any[] {
-	let active = entries;
-	try {
-		active = buildContextEntries(entries);
-	} catch {
-		// Fall back to the raw entry list; the cap below keeps it bounded.
-	}
-	const messages: any[] = [];
-	for (const entry of active) {
-		try {
-			messages.push(...sessionEntryToContextMessages(entry));
-		} catch {
-			// One bad entry must not hide the whole transcript.
-		}
-	}
-	return messages;
-}
-
 /**
- * Build Pi's own transcript components for a child session file, so inspecting
- * a subagent looks like looking at the main agent. Returns null when the file
- * is missing or unreadable (callers fall back to the bounded summary).
+ * Build Pi's transcript components from the complete active branch. Unlike the
+ * model context, this intentionally keeps messages from before compaction so
+ * inspection always reaches the parent's first delegated prompt.
  */
 export function buildTranscript(sessionFile: string, tui: TUI, cwd: string): Component[] | null {
-	let content: string;
-	try {
-		content = readFileSync(sessionFile, "utf8");
-	} catch {
-		return null;
-	}
+	if (!existsSync(sessionFile)) return null;
 	let entries: any[];
 	try {
-		entries = parseSessionEntries(content);
+		entries = SessionManager.open(sessionFile, undefined, cwd).getBranch();
 	} catch {
 		return null;
 	}
-	const recent = toMessages(entries).slice(-MAX_MESSAGES);
+
 	const components: Component[] = [];
 	const pending = new Map<string, ToolExecutionComponent>();
-	for (const message of recent) {
+	for (const entry of entries) {
 		try {
-			if (message.role === "user") {
+			if (entry.type === "compaction") {
+				components.push(new Text(`— compacted ${entry.tokensBefore ?? "earlier"} tokens —`, 0, 0));
+				continue;
+			}
+			if (entry.type === "branch_summary") {
+				const summary = typeof entry.summary === "string" ? entry.summary.split("\n")[0] : "branch summary";
+				components.push(new Text(`— ${summary} —`, 0, 0));
+				continue;
+			}
+			if (entry.type === "custom_message") {
+				const text = userText(entry.content);
+				if (entry.display && text.trim()) components.push(new Text(text, 1, 0));
+				continue;
+			}
+			if (entry.type !== "message") continue;
+			const message = entry.message;
+			if (message?.role === "user") {
 				const text = userText(message.content);
 				if (text.trim()) components.push(new UserMessageComponent(text));
-			} else if (message.role === "assistant") {
+			} else if (message?.role === "assistant") {
 				if (hasVisibleAssistantContent(message)) components.push(new AssistantMessageComponent(message));
 				for (const part of message.content ?? []) {
 					if (part?.type !== "toolCall") continue;
@@ -98,7 +86,7 @@ export function buildTranscript(sessionFile: string, tui: TUI, cwd: string): Com
 					if (part.id) pending.set(part.id, comp);
 					components.push(comp);
 				}
-			} else if (message.role === "toolResult") {
+			} else if (message?.role === "toolResult") {
 				const comp = message.toolCallId ? pending.get(message.toolCallId) : undefined;
 				if (comp) {
 					try {
@@ -108,16 +96,13 @@ export function buildTranscript(sessionFile: string, tui: TUI, cwd: string): Com
 							isError: !!message.isError,
 						});
 					} catch {
-						// Keep the partial rendering.
+						// Keep the call rendering if a historical result shape changed.
 					}
 					pending.delete(message.toolCallId);
 				}
-			} else if (message.role === "compactionSummary" || message.role === "branchSummary") {
-				const summary = typeof message.summary === "string" ? message.summary.split("\n")[0] : "";
-				if (summary.trim()) components.push(new Text(`— ${summary} —`, 0, 0));
 			}
 		} catch {
-			// One bad message must not hide the whole transcript.
+			// One bad historical entry must not hide the rest of the transcript.
 		}
 	}
 	return components;

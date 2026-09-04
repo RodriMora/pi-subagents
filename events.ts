@@ -49,14 +49,23 @@ export function applyChildEvent(record: AgentRecord, state: ParsedChildState, ev
 			if (typeof event.id === "string") record.sessionId = event.id;
 			break;
 		case "agent_start":
+			state.finalText = "";
+			state.stopReason = undefined;
+			state.errorMessage = undefined;
 			record.status = "thinking";
 			record.activity = "thinking";
+			record.currentTool = undefined;
+			record.error = undefined;
+			record.finishedAt = undefined;
+			record.resultsDelivered = false;
+			record.footerDismissed = false;
 			important = true;
 			break;
 		case "message_start":
 			if (event.message?.role === "assistant") {
 				record.status = "thinking";
 				record.activity = "thinking";
+				record.latestText = undefined;
 				important = true;
 			}
 			break;
@@ -97,6 +106,7 @@ export function applyChildEvent(record: AgentRecord, state: ParsedChildState, ev
 				if (typeof event.message.model === "string") record.model = `${event.message.provider}/${event.message.model}`;
 				state.stopReason = event.message.stopReason;
 				state.errorMessage = event.message.errorMessage;
+				record.activity = "thinking";
 				addUsage(record.usage, event.message.usage);
 				important = true;
 			}

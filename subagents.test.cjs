@@ -41,8 +41,10 @@ function check(name, cond, extra) {
 	const config = await jiti.import(path.join(HERE, "config.ts"));
 	const registry = await jiti.import(path.join(HERE, "registry.ts"));
 	const events = await jiti.import(path.join(HERE, "events.ts"));
+	const control = await jiti.import(path.join(HERE, "control.ts"));
 	const spawn = await jiti.import(path.join(HERE, "spawn-agent.ts"));
 	const { SubagentPanel } = await jiti.import(path.join(HERE, "panel.ts"));
+	await jiti.import(path.join(HERE, "index.ts"));
 
 	// --- config ---
 	const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "subagents-test-"));
@@ -97,6 +99,17 @@ function check(name, cond, extra) {
 	check("descendants order", JSON.stringify(desc) === JSON.stringify(["child1", "grand", "child2"]), desc.join(","));
 	const depths = registry.relativeDepths(all, "root");
 	check("relative depths", depths.get("child1") === 0 && depths.get("grand") === 1, JSON.stringify([...depths]));
+
+	// --- control inbox ---
+	control.queueSubagentMessage(agentDir2, { targetRunId: "child1", rootRunId: "root", text: "change direction" });
+	const inbox = control.consumeSubagentMessages(agentDir2, "child1", "root");
+	check("control inbox delivers message", inbox.length === 1 && inbox[0].text === "change direction", JSON.stringify(inbox));
+	check("control inbox consumes once", control.consumeSubagentMessages(agentDir2, "child1", "root").length === 0);
+	registry.saveRecord(agentDir2, mk("child1", "root", { status: "thinking" }));
+	registry.saveRecord(agentDir2, mk("grand", "child1", { status: "running_tool" }));
+	spawn.cancelSubagent(agentDir2, registry.readRecords(agentDir2).find((r) => r.runId === "child1"));
+	const cancelledTree = registry.readRecords(agentDir2);
+	check("cancelling parent cancels descendants", ["child1", "grand"].every((id) => cancelledTree.find((r) => r.runId === id)?.status === "cancelled"));
 	registry.saveRecord(agentDir2, mk("stale", "root", { status: "running_tool", pid: 2147483647 }));
 	const stale = registry.readRecords(agentDir2).find((r) => r.runId === "stale");
 	check("dead pid reconciled to failed", stale && stale.status === "failed", stale && stale.status);
@@ -139,9 +152,39 @@ function check(name, cond, extra) {
 	r2();
 
 	// --- panel ---
+	const piRoot = await jiti.import("@earendil-works/pi-coding-agent");
+	piRoot.initTheme("dark");
 	const theme = { fg: (_c, t) => String(t), bg: (_c, t) => String(t), bold: (t) => String(t), getSelectionBackgroundColor: () => (t) => String(t) };
 	const focusedTarget = { value: "unset" };
-	const tui = { requestRender: () => {}, setFocus: (c) => { focusedTarget.value = c ? "panel" : "null"; } };
+	let focusedComponent;
+	let activeOverlay;
+	const tui = {
+		terminal: { rows: 40, columns: 100 },
+		requestRender: () => {},
+		setFocus: (component) => {
+			if (focusedComponent && "focused" in focusedComponent) focusedComponent.focused = false;
+			focusedComponent = component;
+			if (focusedComponent && "focused" in focusedComponent) focusedComponent.focused = true;
+			focusedTarget.value = component ? "panel" : "null";
+		},
+		showOverlay: function (component) {
+			const previous = focusedComponent;
+			activeOverlay = component;
+			this.setFocus(component);
+			return {
+				hide: () => {
+					if (activeOverlay !== component) return;
+					activeOverlay = undefined;
+					this.setFocus(previous ?? null);
+				},
+				setHidden: () => {},
+				isHidden: () => false,
+				focus: () => this.setFocus(component),
+				unfocus: () => this.setFocus(previous ?? null),
+				isFocused: () => focusedComponent === component,
+			};
+		},
+	};
 	let panel = new SubagentPanel(tui, theme, agentDir2, "nope");
 	check("empty renders nothing", panel.render(80).length === 0);
 	panel.dispose();
@@ -154,7 +197,7 @@ function check(name, cond, extra) {
 	check("footer shows main with model", summary.length > 0 && summary[0].includes("main") && summary[0].includes("p/m"), JSON.stringify(summary));
 	check("footer shows running child", summary.some((l) => l.includes("alpha")) && summary.some((l) => l.includes("npm test")), summary.join(" | "));
 	check("footer shows child provider/model", summary.some((l) => l.includes("prov/model-x")), summary.join(" | "));
-	panel.focused = true;
+	tui.setFocus(panel);
 	const list = panel.render(100);
 	check("list shows children", list.some((l) => l.includes("alpha")) && list.some((l) => l.includes("beta")), list.join(" | "));
 	panel.handleInput("");
@@ -201,6 +244,53 @@ function check(name, cond, extra) {
 	check("usage captured", polled && polled.usage.input === 10, polled && JSON.stringify(polled.usage));
 	await new Promise((r) => setTimeout(r, 250));
 	check("onSettled fired", settled.includes("completed"), JSON.stringify(settled));
+
+	const steered = await spawn.sendSubagentMessage(polled, "focus on tests");
+	check("live RPC child accepts steering", steered === true);
+	for (let i = 0; i < 100; i++) {
+		polled = registry.readRecords(spawnAgentDir).find((r) => r.runId === rec1.runId);
+		if (polled && polled.status === "completed" && polled.latestText === "steered: focus on tests") break;
+		await new Promise((r) => setTimeout(r, 50));
+	}
+	check("steered child completes another turn", polled && polled.latestText === "steered: focus on tests", polled && polled.latestText);
+
+	process.env.FAKE_DELAY_MS = "100";
+	const immediateRec = await spawn.startSubagent({ task: "initial", name: "immediate-child" }, baseCtx());
+	const immediateAccepted = await spawn.sendSubagentMessage(immediateRec, "immediate steer");
+	delete process.env.FAKE_DELAY_MS;
+	for (let i = 0; i < 100; i++) {
+		const row = registry.readRecords(spawnAgentDir).find((r) => r.runId === immediateRec.runId);
+		if (row?.latestText === "steered: immediate steer" && row.status === "completed") break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	const immediateDone = registry.readRecords(spawnAgentDir).find((r) => r.runId === immediateRec.runId);
+	check("immediate steering waits for RPC startup", immediateAccepted && immediateDone?.latestText === "steered: immediate steer", immediateDone?.latestText);
+
+	let uiRequest;
+	const uiRec = await spawn.startSubagent({ task: "ui-request", name: "ui-child" }, {
+		...baseCtx(),
+		onUiRequest: async (_record, request) => {
+			uiRequest = request;
+			return { value: "approved" };
+		},
+	});
+	for (let i = 0; i < 100; i++) {
+		const row = registry.readRecords(spawnAgentDir).find((r) => r.runId === uiRec.runId);
+		if (row && row.status === "completed") break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	const uiDone = registry.readRecords(spawnAgentDir).find((r) => r.runId === uiRec.runId);
+	check("child UI request forwarded", uiRequest && uiRequest.method === "select", uiRequest && JSON.stringify(uiRequest));
+	check("child UI response returned", uiDone && uiDone.latestText === "ui: approved", uiDone && uiDone.latestText);
+
+	const rejectedRec = await spawn.startSubagent({ task: "reject", name: "rejected-child" }, baseCtx());
+	for (let i = 0; i < 100; i++) {
+		const row = registry.readRecords(spawnAgentDir).find((r) => r.runId === rejectedRec.runId);
+		if (row?.status === "failed") break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	const rejectedDone = registry.readRecords(spawnAgentDir).find((r) => r.runId === rejectedRec.runId);
+	check("rejected RPC prompt fails without hanging", rejectedDone?.status === "failed" && rejectedDone.error?.includes("fake rejection"), rejectedDone && `${rejectedDone.status} ${rejectedDone.error}`);
 
 	process.env.FAKE_EXIT = "1";
 	const failRec = await spawn.startSubagent({ task: "fail", name: "failer" }, { ...baseCtx(), onSettled: (r) => settled.push(r.status) });
@@ -262,11 +352,36 @@ function check(name, cond, extra) {
 	delete process.env.FAKE_DELAY_MS;
 
 	// --- navigation: right opens detail, left goes back, left closes ---
-	tui.setFocus = (c) => { focusedTarget.value = c ? "panel" : "null"; };
-	const navPanel = new SubagentPanel(tui, theme, agentDir2, "root2");
-	navPanel.focused = true;
+	const navSession = path.join(sandbox, "nav-child.jsonl");
+	const navLines = [{ type: "session", version: 3, id: "nav", timestamp: new Date().toISOString(), cwd: "/tmp" }];
+	let navParent = null;
+	for (let i = 0; i < 80; i++) {
+		const id = `nav-${i}`;
+		navLines.push({ type: "message", id, parentId: navParent, timestamp: new Date().toISOString(), message: { role: "user", content: `navigation message ${i}`, timestamp: i } });
+		navParent = id;
+	}
+	fs.writeFileSync(navSession, navLines.map((line) => JSON.stringify(line)).join("\n"));
+	registry.saveRecord(agentDir2, mk("alpha", "root2", { status: "running_tool", currentTool: "bash npm test", latestText: "testing…", model: "prov/model-x", sessionId: "nav", sessionFile: navSession }));
+	let sentFromPanel;
+	const navPanel = new SubagentPanel(tui, theme, agentDir2, "root2", {
+		onMessage: async (record, text) => { sentFromPanel = `${record.runId}:${text}`; },
+	});
+	tui.setFocus(navPanel);
 	navPanel.handleInput("\x1b[C");
-	check("right opens detail", navPanel.render(100).some((l) => l.includes("Task")), navPanel.render(100).join(" | "));
+	const detailView = activeOverlay ? activeOverlay.render(100) : navPanel.render(100);
+	check("right opens focused transcript overlay", !!activeOverlay && detailView.some((l) => l.includes("navigation message")), detailView.join(" | "));
+	check("transcript overlay owns focus", focusedComponent === activeOverlay && navPanel.focused === false, `${focusedComponent === activeOverlay} ${navPanel.focused} ${focusedComponent?.constructor?.name} ${activeOverlay?.constructor?.name}`);
+	const beforePageScroll = activeOverlay.render(100).join("\n");
+	activeOverlay.handleInput("\x1b[5~");
+	const afterPageScroll = activeOverlay.render(100).join("\n");
+	check("page scroll changes child transcript", beforePageScroll !== afterPageScroll && afterPageScroll.includes("navigation message"));
+	activeOverlay.handleInput("\x1b[<64;1;1M");
+	check("mouse wheel reaches child transcript", activeOverlay.render(100).join("\n") !== afterPageScroll);
+	navPanel.handleInput("g");
+	navPanel.handleInput("o");
+	navPanel.handleInput("\r");
+	await new Promise((r) => setTimeout(r, 0));
+	check("transcript input sends without closing", sentFromPanel === "alpha:go" && activeOverlay?.render(100).some((l) => l.includes("Message this subagent")), sentFromPanel);
 	navPanel.handleInput("\x1b[D");
 	const backToList = navPanel.render(100);
 	check("left returns to list", backToList.some((l) => l.includes("alpha")) && !backToList.some((l) => l.includes("Task")), backToList.join(" | "));
@@ -301,8 +416,6 @@ function check(name, cond, extra) {
 
 	// --- transcript: child session renders like the main agent ---
 	const { buildTranscript } = await jiti.import(path.join(HERE, "transcript.ts"));
-	const piRoot = await jiti.import("@earendil-works/pi-coding-agent");
-	piRoot.initTheme("dark");
 	const sessFile = path.join(sandbox, "child.jsonl");
 	const usageFull = { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.001 } };
 	const sessLines = [
@@ -323,6 +436,21 @@ function check(name, cond, extra) {
 		check("transcript shows tool call", rendered.includes("echo hi"), rendered.slice(0, 500));
 	}
 	check("transcript null for missing file", buildTranscript(path.join(sandbox, "nope.jsonl"), tuiMock, "/tmp") === null);
+
+	const longFile = path.join(sandbox, "long-child.jsonl");
+	const longLines = [{ type: "session", version: 3, id: "long", timestamp: new Date().toISOString(), cwd: "/tmp" }];
+	let parentId = null;
+	for (let i = 0; i < 70; i++) {
+		const id = `m${String(i).padStart(7, "0")}`;
+		longLines.push({ type: "message", id, parentId, timestamp: new Date().toISOString(), message: { role: "user", content: i === 0 ? "the very first delegated prompt" : `later ${i}`, timestamp: i } });
+		parentId = id;
+	}
+	longLines.push({ type: "compaction", id: "compact1", parentId, timestamp: new Date().toISOString(), summary: "recent history", firstKeptEntryId: "m0000060", tokensBefore: 10000 });
+	longLines.push({ type: "message", id: "aftercmp", parentId: "compact1", timestamp: new Date().toISOString(), message: { role: "user", content: "after compaction", timestamp: 71 } });
+	fs.writeFileSync(longFile, longLines.map((line) => JSON.stringify(line)).join("\n"));
+	const longComps = buildTranscript(longFile, tuiMock, "/tmp");
+	const longRendered = longComps && longComps.flatMap((c) => c.render(100)).join("\n");
+	check("full transcript keeps first prompt past 60 messages", !!longRendered && longRendered.includes("the very first delegated prompt"), longRendered && longRendered.slice(0, 200));
 
 	fs.rmSync(sandbox, { recursive: true, force: true });
 	console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURES`);

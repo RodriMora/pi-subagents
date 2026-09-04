@@ -9,9 +9,10 @@ import {
 import { Key, Markdown, matchesKey, Text, type EditorTheme, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { currentDepth, loadSettings } from "./config.ts";
+import { consumeSubagentMessages, queueSubagentMessage } from "./control.ts";
 import { SubagentPanel } from "./panel.ts";
-import { isTerminalStatus, readRecords, saveRecord } from "./registry.ts";
-import { cancelSubagent, killPidTree, startSubagent } from "./spawn-agent.ts";
+import { isProcessAlive, isTerminalStatus, readRecords, saveRecord } from "./registry.ts";
+import { cancelSubagent, killPidTree, sendSubagentMessage, startSubagent } from "./spawn-agent.ts";
 import { descendantsOf } from "./registry.ts";
 import type { AgentRecord, SubagentSettings } from "./types.ts";
 
@@ -41,6 +42,11 @@ const CancelSchema = Type.Object({
 	target: Type.String({ description: "Subagent run id, session id, or exact name" }),
 });
 
+const SendSchema = Type.Object({
+	target: Type.String({ description: "Subagent run id, session id, or exact name" }),
+	message: Type.String({ description: "Instruction or follow-up to send to the subagent" }),
+});
+
 const RESULT_OUTPUT_CAP = 8000;
 
 function cap(text: string, limit: number): string {
@@ -57,6 +63,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	let mainModel: string | undefined;
 	let deliveryTimer: ReturnType<typeof setTimeout> | undefined;
 	let keepAlive: ReturnType<typeof setInterval> | undefined;
+	let inboxTimer: ReturnType<typeof setInterval> | undefined;
 
 	const modelLabel = (ctx: { model?: { provider: string; id: string } }): string | undefined =>
 		ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
@@ -148,7 +155,27 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			if (ctx.hasUI) ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 		}
 
-		if (ctx.mode !== "tui" || !runtime) return;
+		if (!runtime) return;
+
+		// Every subagent process consumes its own private inbox. This keeps
+		// steering recursive: the root UI can address grandchildren directly.
+		if (inboxTimer) clearInterval(inboxTimer);
+		inboxTimer = setInterval(() => {
+			if (!runtime) return;
+			for (const message of consumeSubagentMessages(getAgentDir(), runtime.runId, runtime.rootRunId)) {
+				try {
+					pi.sendUserMessage(message.text, {
+						...(ctx.isIdle() ? {} : { deliverAs: "steer" as const }),
+						expandPromptTemplates: true,
+					});
+				} catch {
+					// The sender will see the unchanged run status; never wedge the inbox.
+				}
+			}
+		}, 150);
+		inboxTimer.unref?.();
+
+		if (ctx.mode !== "tui") return;
 
 		mainModel = modelLabel(ctx);
 
@@ -183,7 +210,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			"subagents",
 			(tui, theme) => {
 				if (!panel) {
-					panel = new SubagentPanel(tui, theme, getAgentDir(), runtime!.runId);
+					panel = new SubagentPanel(tui, theme, getAgentDir(), runtime!.runId, {
+						onMessage: async (record, text) => sendToRecord(record, text),
+						onCancel: (record) => {
+							const latest = readRecords(getAgentDir()).find((item) => item.runId === record.runId) ?? record;
+							if (!isTerminalStatus(latest.status)) trackChild(cancelSubagent(getAgentDir(), latest));
+						},
+					});
 					if (editor) panel.setEditor(editor);
 					panel.setMainModel(mainModel);
 				} else {
@@ -209,6 +242,33 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	const trackChild = (record: AgentRecord) => {
 		refreshKeepAlive();
 		if (isTerminalStatus(record.status)) scheduleDelivery();
+	};
+
+	const resolveRecord = (target: string): AgentRecord => {
+		if (!runtime) throw new Error("Subagent extension settings failed to initialize");
+		const rows = descendantsOf(readRecords(getAgentDir()), runtime.runId);
+		const value = target.trim();
+		const matches = rows.filter((record) => record.runId === value || record.sessionId === value || record.name === value);
+		if (matches.length === 0) throw new Error(`No subagent matches "${value}".`);
+		if (matches.length > 1) {
+			throw new Error(`"${value}" is ambiguous; matches: ${matches.map((record) => `${record.name} (${shortId(record.runId)})`).join(", ")}`);
+		}
+		return matches[0]!;
+	};
+
+	const sendToRecord = async (record: AgentRecord, text: string): Promise<void> => {
+		if (!runtime) throw new Error("Subagent extension settings failed to initialize");
+		const latest = readRecords(getAgentDir()).find((item) => item.runId === record.runId) ?? record;
+		if (latest.status === "cancelled") throw new Error(`${latest.name} was cancelled`);
+		if (await sendSubagentMessage(latest, text)) return;
+		if (isTerminalStatus(latest.status) && (!latest.pid || !isProcessAlive(latest.pid))) {
+			throw new Error(`${latest.name} is no longer running`);
+		}
+		queueSubagentMessage(getAgentDir(), {
+			targetRunId: latest.runId,
+			rootRunId: runtime.rootRunId,
+			text,
+		});
 	};
 
 	pi.on("input", (event) => {
@@ -238,14 +298,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			clearInterval(keepAlive);
 			keepAlive = undefined;
 		}
-		// This pi process is going away: stop its background children so they
-		// do not outlive the session that owns them.
+		if (inboxTimer) {
+			clearInterval(inboxTimer);
+			inboxTimer = undefined;
+		}
+		// This pi process is going away: stop every live descendant. Completed
+		// RPC children stay resumable only for the lifetime of their parent session.
 		if (!runtime) return;
 		const agentDir = getAgentDir();
-		for (const record of readRecords(agentDir)) {
-			if (record.parentRunId !== runtime.runId || isTerminalStatus(record.status)) continue;
+		for (const record of descendantsOf(readRecords(agentDir), runtime.runId)) {
+			if (!record.pid || !isProcessAlive(record.pid)) continue;
 			try {
-				cancelSubagent(agentDir, record);
+				if (isTerminalStatus(record.status)) killPidTree(record.pid);
+				else cancelSubagent(agentDir, record);
 			} catch {
 				// Best effort cleanup.
 			}
@@ -293,8 +358,31 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					parentThinking: ctx.thinkingLevel,
 					parentCwd: ctx.cwd,
 					projectTrusted: runtime.projectTrusted,
+					persistAfterSettled: ctx.mode === "tui" || ctx.mode === "rpc",
 					signal,
 					onRecord: trackChild,
+					onUiRequest: async (child, request) => {
+						const title = `[${child.name}] ${request.title || "Subagent request"}`;
+						const opts = typeof request.timeout === "number" ? { timeout: request.timeout } : undefined;
+						switch (request.method) {
+							case "select": {
+								const value = await ctx.ui.select(title, request.options ?? [], opts);
+								return value === undefined ? { cancelled: true } : { value };
+							}
+							case "confirm":
+								return { confirmed: await ctx.ui.confirm(title, request.message ?? "", opts) };
+							case "input": {
+								const value = await ctx.ui.input(title, request.placeholder, opts);
+								return value === undefined ? { cancelled: true } : { value };
+							}
+							case "editor": {
+								const value = await ctx.ui.editor(title, request.prefill);
+								return value === undefined ? { cancelled: true } : { value };
+							}
+							case "notify":
+								ctx.ui.notify(`[${child.name}] ${request.message ?? ""}`, request.notifyType);
+						}
+					},
 					onSettled: trackChild,
 				},
 			);
@@ -384,27 +472,30 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "send_to_subagent",
+		label: "Send to Subagent",
+		description: "Send a course correction or follow-up to a live subagent by run id, session id, or exact name.",
+		promptSnippet: "Steer or follow up with a live background subagent",
+		parameters: SendSchema,
+		async execute(_toolCallId, params) {
+			const record = resolveRecord(params.target);
+			await sendToRecord(record, params.message);
+			return {
+				content: [{ type: "text", text: `Sent a message to ${record.name}.` }],
+				details: { record },
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "cancel_subagent",
 		label: "Cancel Subagent",
 		description: "Cancel a running or queued subagent of this session by run id, session id, or exact name.",
 		promptSnippet: "Stop a running background subagent",
 		parameters: CancelSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			if (!runtime) throw new Error("Subagent extension settings failed to initialize");
 			const agentDir = getAgentDir();
-			const rows = descendantsOf(readRecords(agentDir), runtime.runId);
-			const target = params.target.trim();
-			const matches = rows.filter(
-				(record) => record.runId === target || record.sessionId === target || record.name === target,
-			);
-			if (matches.length === 0) {
-				const names = rows.map((record) => record.name).join(", ") || "none";
-				throw new Error(`No subagent matches "${target}". Known subagents: ${names}.`);
-			}
-			if (matches.length > 1) {
-				throw new Error(`"${target}" is ambiguous; matches: ${matches.map((record) => `${record.name} (${shortId(record.runId)})`).join(", ")}`);
-			}
-			const record = matches[0]!;
+			const record = resolveRecord(params.target);
 			if (isTerminalStatus(record.status)) {
 				return { content: [{ type: "text", text: `${record.name} already finished (${record.status}).` }], details: { record } };
 			}

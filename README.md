@@ -12,7 +12,8 @@ Recursive, isolated, asynchronous subagents for the [Pi coding agent](https://gi
 - **Recursive delegation** — children can create grandchildren within the configured depth budget.
 - **Parallel work** — concurrency is configurable, including unlimited mode with `maxConcurrency: -1`.
 - **Live monitoring** — the footer shows a recursive status tree with provider/model, activity, and elapsed time.
-- **Transcript inspection** — open any child to read its actual Pi session, including messages and tool calls.
+- **Interactive transcripts** — open any child to read its complete Pi session from the original delegation prompt, including messages and tool calls.
+- **Steering and follow-ups** — message a running child to redirect it, or message a finished child to continue its existing session.
 - **Automatic delivery** — finished results are sent back to the parent when it goes idle; `check_subagents` can collect them explicitly.
 - **Cancellation** — stop a running or queued child by run ID, session ID, or name.
 - **No added dependencies** — uses Pi's extension and TUI APIs plus Node.js built-ins.
@@ -56,7 +57,9 @@ Use `check_subagents` to inspect progress or wait for results:
 check_subagents({ wait: true, timeoutMs: 120000 })
 ```
 
-Use `cancel_subagent` with a run ID, session ID, or exact name to stop a child. In TUI mode, press **Down** at the bottom of the editor to open the live subagent panel; use `/subagents` to review finished agents and transcripts.
+Use `send_to_subagent` to steer a running child or continue a completed one. Use `cancel_subagent` to stop a child. Both accept a run ID, session ID, or exact name.
+
+In TUI mode, press **Down** at the bottom of the editor to open the live subagent panel. Open a transcript, type a message, and press **Enter** to steer or continue that subagent. Use `/subagents` to review finished agents and transcripts.
 
 ## Tools
 
@@ -90,6 +93,14 @@ check_subagents({ wait: true, timeoutMs: 120000 })
 ```
 
 `timeoutMs` defaults to 30 seconds and is capped at 300 seconds.
+
+### `send_to_subagent`
+
+Steer a running child or continue its completed session by exact name, run ID, or session ID:
+
+```text
+send_to_subagent({ target: "auth-reviewer", message: "Focus on the token refresh path." })
+```
 
 ### `cancel_subagent`
 
@@ -133,9 +144,11 @@ main · openai-codex/gpt-5.5
 ```
 
 - Press **Down** at the bottom edge of the editor to inspect subagents.
-- Press **Up/Down** to select; **Enter/Right** to open a child transcript.
+- Press **Up/Down** to select; **Enter/Right** to open a child transcript; **x** stops a running child.
+- In a transcript, type a message and press **Enter** to steer or continue the child.
+- Transcripts open in a focused overlay: **Up/Down**, **PageUp/PageDown**, and mouse-wheel scrolling affect only the child transcript, not the main conversation.
+- In a transcript, **Esc** or **Left** on an empty input returns.
 - Press **Left** to go back; **Esc** is also supported.
-- In a transcript, **Up/Down** scrolls and **Left** returns.
 - Finished children remain visible until the next user turn, then leave the footer. Use `/subagents` to review full history.
 
 ## Development
@@ -151,7 +164,8 @@ Source files are organized by responsibility:
 - `index.ts` — Pi registration, lifecycle hooks, tools, delivery, and UI wiring
 - `config.ts` — settings validation and precedence
 - `registry.ts` — atomic run records
-- `spawn-agent.ts` — process launching, concurrency, cancellation, and depth enforcement
+- `spawn-agent.ts` — RPC process control, concurrency, cancellation, and depth enforcement
+- `control.ts` — atomic descendant message inboxes
 - `events.ts` — child JSON event parsing and status updates
 - `panel.ts` — footer tree, selection, and transcript detail view
 - `transcript.ts` — rendering child session files
