@@ -1,8 +1,26 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	readdirSync,
+	renameSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import type { AgentRecord, AgentStatus } from "./types.ts";
 
 const TERMINAL = new Set<AgentStatus>(["completed", "failed", "cancelled"]);
+const LOCK_STALE_MS = 30_000;
+const LOCK_WAIT_MS = 5_000;
+
+interface CancellationMarker {
+	version: 1;
+	runId: string;
+	cancelledAt: string;
+	error?: string;
+}
 
 export function isTerminalStatus(status: AgentStatus): boolean {
 	return TERMINAL.has(status);
@@ -12,21 +30,167 @@ export function registryDir(agentDir: string): string {
 	return join(agentDir, "subagents", "runs");
 }
 
-function recordPath(agentDir: string, runId: string): string {
-	return join(registryDir(agentDir), `${runId.replace(/[^a-zA-Z0-9._-]/g, "_")}.json`);
+function safeRunId(runId: string): string {
+	return runId.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
-export function saveRecord(agentDir: string, record: AgentRecord): void {
-	const dir = registryDir(agentDir);
-	mkdirSync(dir, { recursive: true, mode: 0o700 });
-	const target = recordPath(agentDir, record.runId);
-	const temporary = `${target}.tmp-${process.pid}-${Date.now()}`;
-	writeFileSync(temporary, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+function recordPath(agentDir: string, runId: string): string {
+	return join(registryDir(agentDir), `${safeRunId(runId)}.json`);
+}
+
+function markerPath(agentDir: string, runId: string, kind: "cancelled" | "closed"): string {
+	return join(registryDir(agentDir), `${safeRunId(runId)}.${kind}`);
+}
+
+function atomicWrite(target: string, contents: string): void {
+	const temporary = `${target}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+	writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600 });
 	try {
 		renameSync(temporary, target);
 	} catch (error) {
 		rmSync(temporary, { force: true });
 		throw error;
+	}
+}
+
+function writeCancellationMarker(agentDir: string, record: AgentRecord): void {
+	const target = markerPath(agentDir, record.runId, "cancelled");
+	if (existsSync(target)) return;
+	const marker: CancellationMarker = {
+		version: 1,
+		runId: record.runId,
+		cancelledAt: record.finishedAt ?? new Date().toISOString(),
+		error: record.error,
+	};
+	atomicWrite(target, `${JSON.stringify(marker)}\n`);
+}
+
+function readCancellationMarker(agentDir: string, runId: string): CancellationMarker | undefined {
+	const target = markerPath(agentDir, runId, "cancelled");
+	if (!existsSync(target)) return undefined;
+	try {
+		const value = JSON.parse(readFileSync(target, "utf8")) as Partial<CancellationMarker>;
+		if (value.version === 1 && value.runId === runId && typeof value.cancelledAt === "string") {
+			return value as CancellationMarker;
+		}
+	} catch {
+		// The marker's existence is enough to keep cancellation monotonic.
+	}
+	return { version: 1, runId, cancelledAt: new Date().toISOString(), error: "Cancelled" };
+}
+
+function applyMarkers(agentDir: string, record: AgentRecord): AgentRecord {
+	let result = record;
+	const cancellation = readCancellationMarker(agentDir, record.runId);
+	if (cancellation) {
+		result = {
+			...result,
+			status: "cancelled",
+			activity: "cancelled",
+			currentTool: undefined,
+			error: cancellation.error ?? result.error ?? "Cancelled",
+			finishedAt: cancellation.cancelledAt,
+			updatedAt:
+				Date.parse(result.updatedAt) > Date.parse(cancellation.cancelledAt)
+					? result.updatedAt
+					: cancellation.cancelledAt,
+		};
+	}
+	if (existsSync(markerPath(agentDir, record.runId, "closed"))) {
+		result = { ...result, pid: undefined, pidStartTime: undefined };
+	}
+	return result;
+}
+
+/**
+ * Persist a record atomically. Cancellation and process-close marker files are
+ * separate monotonic facts, so a stale writer in another process cannot undo
+ * either state by replacing the JSON record later.
+ */
+export function saveRecord(agentDir: string, record: AgentRecord): AgentRecord {
+	const dir = registryDir(agentDir);
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	if (record.status === "cancelled") writeCancellationMarker(agentDir, record);
+	const saved = applyMarkers(agentDir, record);
+	atomicWrite(recordPath(agentDir, record.runId), `${JSON.stringify(saved)}\n`);
+	return saved;
+}
+
+/** Mark a child PID as permanently cleared before writing its final record. */
+export function clearRecordPid(agentDir: string, record: AgentRecord): AgentRecord {
+	const dir = registryDir(agentDir);
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const target = markerPath(agentDir, record.runId, "closed");
+	if (!existsSync(target)) atomicWrite(target, `${new Date().toISOString()}\n`);
+	return saveRecord(agentDir, { ...record, pid: undefined, pidStartTime: undefined });
+}
+
+export function isRecordCancelled(agentDir: string, runId: string): boolean {
+	return existsSync(markerPath(agentDir, runId, "cancelled"));
+}
+
+function sleepSync(ms: number): void {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function randomToken(): string {
+	return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+/** Serialize the launch/cancel decision for one run across Pi processes. */
+export function withRecordLock<T>(agentDir: string, runId: string, operation: () => T): T {
+	const dir = registryDir(agentDir);
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const lock = join(dir, `${safeRunId(runId)}.lock`);
+	const token = `${process.pid}-${randomToken()}`;
+	const deadline = Date.now() + LOCK_WAIT_MS;
+	while (true) {
+		try {
+			mkdirSync(lock, { mode: 0o700 });
+			try {
+				writeFileSync(join(lock, "owner"), `${token}\n`, { encoding: "utf8", mode: 0o600 });
+			} catch (error) {
+				rmSync(lock, { recursive: true, force: true });
+				throw error;
+			}
+			break;
+		} catch (error: any) {
+			if (error?.code !== "EEXIST") throw error;
+			let stale = false;
+			try {
+				const age = Date.now() - statSync(lock).mtimeMs;
+				if (age > LOCK_STALE_MS) stale = true;
+				else {
+					const owner = Number(readFileSync(join(lock, "owner"), "utf8").trim().split("-", 1)[0]);
+					stale = Number.isInteger(owner) && owner > 0 && !isProcessAlive(owner);
+				}
+			} catch {
+				// A creator may be between mkdir and writing owner. Give it time.
+			}
+			if (stale) {
+				const quarantine = `${lock}.stale-${process.pid}-${randomToken()}`;
+				try {
+					renameSync(lock, quarantine);
+					rmSync(quarantine, { recursive: true, force: true });
+				} catch {
+					// Another contender replaced or removed the stale lock.
+				}
+				continue;
+			}
+			if (Date.now() >= deadline) throw new Error(`Timed out waiting for subagent record lock: ${runId}`);
+			sleepSync(5);
+		}
+	}
+	try {
+		return operation();
+	} finally {
+		try {
+			if (readFileSync(join(lock, "owner"), "utf8").trim() === token) {
+				rmSync(lock, { recursive: true, force: true });
+			}
+		} catch {
+			// A stale-lock recovery may already have moved this lock aside.
+		}
 	}
 }
 
@@ -68,15 +232,16 @@ export function readRecords(agentDir: string): AgentRecord[] {
 		try {
 			const value: unknown = JSON.parse(readFileSync(join(dir, name), "utf8"));
 			if (!isRecord(value)) continue;
-			if (!TERMINAL.has(value.status) && value.pid && !isProcessAlive(value.pid)) {
+			const marked = applyMarkers(agentDir, value);
+			if (!TERMINAL.has(marked.status) && marked.pid && !isProcessAlive(marked.pid)) {
 				records.push({
-					...value,
+					...marked,
 					status: "failed",
 					activity: "process exited unexpectedly",
-					error: value.error ?? "Subagent process is no longer running",
+					error: marked.error ?? "Subagent process is no longer running",
 				});
 			} else {
-				records.push(value);
+				records.push(marked);
 			}
 		} catch {
 			// A malformed or half-cleaned record must not break the whole panel.
