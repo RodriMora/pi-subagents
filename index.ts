@@ -76,7 +76,7 @@ const SpawnAgentSchema = Type.Object({
 	thinking: Type.Optional(
 		Type.String({ description: "Thinking level for this subagent", enum: [...THINKING_LEVEL_VALUES] }),
 	),
-	tools: Type.Optional(Type.Array(Type.String(), { description: "Optional exact tool allowlist" })),
+	tools: Type.Optional(Type.Array(Type.String(), { description: "Exact subset of the creating session's active tools; omit to inherit all active tools" })),
 });
 
 const CheckSchema = Type.Object({
@@ -374,7 +374,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		name: "spawn_agent",
 		label: "Spawn Agent",
 		description:
-			"Spawn an isolated recursive Pi subagent that runs in the background and returns immediately. Omit model to use subagents.json defaultModel, or inherit the creating agent's active model. The child keeps running while you do other work; collect results with check_subagents (results also arrive automatically when you go idle).",
+			"Spawn an isolated recursive Pi subagent that runs in the background and returns immediately. Omit model to use subagents.json defaultModel, or inherit the creating agent's active model. Omit tools to inherit the creating session's active tools; an explicit list may only remove tools. The child keeps running while you do other work; collect results with check_subagents (results also arrive automatically when you go idle).",
 		promptSnippet: "Delegate focused independent work to an isolated recursive subagent running in the background",
 		promptGuidelines: [
 			"spawn_agent returns immediately; the child keeps running while you continue other work.",
@@ -401,6 +401,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					settings: runtime.settings,
 					parentModel,
 					parentThinking: ctx.thinkingLevel ?? "off",
+					parentTools: pi.getActiveTools(),
+					scopedModels: ctx.scopedModels.map(({ model, thinkingLevel }) => ({ provider: model.provider, id: model.id, thinkingLevel })),
 					parentCwd: ctx.cwd,
 					projectTrusted: runtime.projectTrusted,
 					persistAfterSettled: ctx.mode === "tui" || ctx.mode === "rpc",

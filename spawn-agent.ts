@@ -111,6 +111,12 @@ export async function sendSubagentMessage(record: AgentRecord, message: string, 
 	return true;
 }
 
+export interface ScopedModelCapability {
+	provider: string;
+	id: string;
+	thinkingLevel?: string;
+}
+
 export interface SpawnContext {
 	agentDir: string;
 	parentRunId: string;
@@ -119,6 +125,8 @@ export interface SpawnContext {
 	settings: SubagentSettings;
 	parentModel?: string;
 	parentThinking?: string;
+	parentTools: readonly string[];
+	scopedModels: readonly ScopedModelCapability[];
 	parentCwd: string;
 	projectTrusted: boolean;
 	persistAfterSettled?: boolean;
@@ -147,6 +155,80 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	return /^(node|bun)(\.exe)?$/.test(executable)
 		? { command: "pi", args }
 		: { command: process.execPath, args };
+}
+
+function validateToolName(name: string): void {
+	if (!name.trim()) throw new Error("Subagent tool names must not be blank");
+	if (name !== name.trim()) {
+		throw new Error(`Subagent tool name must not have leading or trailing whitespace: ${JSON.stringify(name)}`);
+	}
+	if (name.includes(",")) throw new Error(`Subagent tool name must not contain a comma: ${JSON.stringify(name)}`);
+	if (/\p{Cc}/u.test(name)) throw new Error(`Subagent tool name must not contain control characters: ${JSON.stringify(name)}`);
+}
+
+/** Resolve the child's exact tool allowlist without granting anything its parent lacks. */
+export function resolveChildTools(requested: readonly string[] | undefined, parentTools: readonly string[]): string[] {
+	const effective = requested === undefined ? parentTools : requested;
+	for (const name of effective) validateToolName(name);
+	if (requested === undefined) return [...new Set(parentTools)];
+	const available = new Set(parentTools);
+	const unavailable = [...new Set(requested.filter((name) => !available.has(name)))];
+	if (unavailable.length > 0) {
+		throw new Error(
+			`Subagent tools must be a subset of the creating session's active tools; unavailable: ${unavailable.join(", ")}`,
+		);
+	}
+	return [...new Set(requested)];
+}
+
+function canonicalModel(model: ScopedModelCapability): string {
+	return `${model.provider}/${model.id}`;
+}
+
+/** Canonicalize a requested model against a nonempty parent model scope. */
+export function resolveChildModel(model: string, scopedModels: readonly ScopedModelCapability[]): string {
+	if (scopedModels.length === 0) return model;
+	const normalized = model.toLowerCase();
+	const exact = scopedModels.find((item) => canonicalModel(item).toLowerCase() === normalized);
+	if (exact) return canonicalModel(exact);
+	const bareMatches = scopedModels.filter((item) => item.id.toLowerCase() === normalized);
+	if (bareMatches.length === 1) return canonicalModel(bareMatches[0]!);
+	if (bareMatches.length > 1) {
+		throw new Error(`Subagent model "${model}" is ambiguous within the creating session's model scope`);
+	}
+	throw new Error(`Subagent model "${model}" is outside the creating session's model scope`);
+}
+
+function scopedPin(model: string, scopedModels: readonly ScopedModelCapability[]): string | undefined {
+	return scopedModels.find((item) => canonicalModel(item).toLowerCase() === model.toLowerCase())?.thinkingLevel;
+}
+
+function resolveChildThinking(
+	requested: string | undefined,
+	model: string,
+	scopedModels: readonly ScopedModelCapability[],
+	fallback: string,
+): string {
+	const pinned = scopedPin(model, scopedModels);
+	const value = requested?.trim();
+	if (value) {
+		if (pinned && value !== pinned) {
+			throw new Error(`Subagent thinking "${value}" is outside the creating session's pin for ${model} (${pinned})`);
+		}
+		return value;
+	}
+	return pinned || fallback;
+}
+
+function scopedModelArgs(scopedModels: readonly ScopedModelCapability[]): string[] {
+	if (scopedModels.length === 0) return [];
+	const names = scopedModels.map((item) => `${canonicalModel(item)}${item.thinkingLevel ? `:${item.thinkingLevel}` : ""}`);
+	for (const name of names) {
+		if (name.includes(",") || /\p{Cc}/u.test(name)) {
+			throw new Error(`Cannot pass scoped model to a subagent: ${JSON.stringify(name)}`);
+		}
+	}
+	return ["--models", names.join(",")];
 }
 
 function compactName(input: SpawnAgentInput): string {
@@ -378,14 +460,20 @@ export async function startSubagent(input: SpawnAgentInput, context: SpawnContex
 	const runId = randomUUID();
 	const parentCwd = ensureDirectory(context.parentCwd);
 	const cwd = ensureDirectory(input.cwd ? resolve(parentCwd, input.cwd) : parentCwd);
-	const model = input.model?.trim() || context.settings.defaultModel || context.parentModel;
-	if (!model) {
+	const selectedModel = input.model?.trim() || context.settings.defaultModel || context.parentModel;
+	if (!selectedModel) {
 		throw new Error("No subagent model is available; choose a parent model or configure defaultModel");
 	}
+	const model = resolveChildModel(selectedModel, context.scopedModels);
+	const tools = resolveChildTools(input.tools, context.parentTools);
+	scopedModelArgs(context.scopedModels);
 	const thinking = validateThinkingLevel(
-		input.thinking !== undefined
-			? input.thinking
-			: context.settings.defaultThinking || context.parentThinking || "off",
+		resolveChildThinking(
+			input.thinking,
+			model,
+			context.scopedModels,
+			context.settings.defaultThinking || context.parentThinking || "off",
+		),
 		"thinking",
 	);
 	const now = new Date().toISOString();
@@ -400,7 +488,7 @@ export async function startSubagent(input: SpawnAgentInput, context: SpawnContex
 		cwd,
 		model,
 		thinking,
-		tools: input.tools,
+		tools,
 		depth: context.currentDepth + 1,
 		maxDepth: context.settings.maxDepth,
 		status: queued ? "queued" : "starting",
@@ -510,7 +598,9 @@ async function runSubagentProcess(
 			systemPrompt,
 		];
 		if (record.thinking) args.push("--thinking", record.thinking);
-		if (input.tools?.length) args.push("--tools", input.tools.join(","));
+		args.push(...scopedModelArgs(context.scopedModels));
+		if (record.tools?.length) args.push("--tools", record.tools.join(","));
+		else args.push("--no-tools");
 
 		let stderr = "";
 		let buffer = "";

@@ -15,6 +15,15 @@ if (process.env.FAKE_ARGS_DIR && process.env.PI_SUBAGENT_RUN_ID) {
 	);
 }
 
+if (process.env.FAKE_ARGS_DIR && process.env.PI_SUBAGENT_RUN_ID) {
+	const fs = require("node:fs");
+	fs.mkdirSync(process.env.FAKE_ARGS_DIR, { recursive: true });
+	fs.writeFileSync(
+		require("node:path").join(process.env.FAKE_ARGS_DIR, `${process.env.PI_SUBAGENT_RUN_ID}.json`),
+		JSON.stringify(process.argv.slice(2)),
+	);
+}
+
 const line = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
 
 let runCount = 0;
