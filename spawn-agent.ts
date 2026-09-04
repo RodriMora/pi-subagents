@@ -1,15 +1,25 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { validateThinkingLevel } from "./config.ts";
 import { applyChildEvent, type ParsedChildState } from "./events.ts";
-import { descendantsOf, isProcessAlive, isTerminalStatus, readRecords, saveRecord } from "./registry.ts";
+import {
+	clearRecordPid,
+	descendantsOf,
+	isProcessAlive,
+	isRecordCancelled,
+	isTerminalStatus,
+	readRecords,
+	saveRecord,
+	withRecordLock,
+} from "./registry.ts";
 import { EMPTY_USAGE, type AgentRecord, type SpawnAgentInput, type SubagentSettings } from "./types.ts";
 
 const STDERR_LIMIT = 4000;
+const TERMINATION_WAIT_MS = 5000;
 const RPC_REQUEST_TIMEOUT_MS = 15_000;
 const RPC_STARTUP_TIMEOUT_MS = 30_000;
 const STDOUT_LINE_LIMIT = 1024 * 1024;
@@ -75,8 +85,17 @@ interface StartingChild {
 	messages: string[];
 }
 
+interface OwnedChild {
+	pid: number;
+	closed: Promise<void>;
+	terminate(): Promise<void>;
+}
+
 const liveChildren = new Map<string, LiveChild>();
 const startingChildren = new Map<string, StartingChild>();
+const ownedChildren = new Map<string, OwnedChild>();
+const childRuns = new Map<string, Promise<void>>();
+const runAbortControllers = new Map<string, AbortController>();
 
 /** Send directly when this process owns the target child, or queue while it starts. */
 export async function sendSubagentMessage(record: AgentRecord, message: string, signal?: AbortSignal): Promise<boolean> {
@@ -147,26 +166,81 @@ function ensureDirectory(value: string): string {
 	return cwd;
 }
 
-export function killPidTree(pid: number): void {
-	if (process.platform === "win32") {
-		spawn("taskkill", ["/pid", String(pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
-		return;
-	}
+interface ProcessIdentity {
+	pid: number;
+	startTime: string;
+	processGroup: number;
+}
+
+function readProcessIdentity(pid: number): ProcessIdentity | undefined {
+	if (process.platform !== "linux") return undefined;
 	try {
-		process.kill(-pid, "SIGTERM");
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const close = stat.lastIndexOf(")");
+		if (close < 0) return undefined;
+		const fields = stat.slice(close + 2).trim().split(/\s+/);
+		const processGroup = Number(fields[2]);
+		const startTime = fields[19];
+		if (!Number.isInteger(processGroup) || !startTime) return undefined;
+		return { pid, processGroup, startTime };
+	} catch {
+		return undefined;
+	}
+}
+
+function sameProcess(identity: ProcessIdentity): boolean {
+	const current = readProcessIdentity(identity.pid);
+	return !!current && current.startTime === identity.startTime;
+}
+
+function processGroupSnapshot(group: number): ProcessIdentity[] {
+	if (process.platform !== "linux") return [];
+	const members: ProcessIdentity[] = [];
+	try {
+		for (const name of readdirSync("/proc")) {
+			if (!/^\d+$/.test(name)) continue;
+			const identity = readProcessIdentity(Number(name));
+			if (identity?.processGroup === group) members.push(identity);
+		}
+	} catch {
+		// /proc may be unavailable or restricted.
+	}
+	return members;
+}
+
+function signalPidTree(pid: number, signal: NodeJS.Signals): void {
+	try {
+		process.kill(-pid, signal);
 	} catch {
 		try {
-			process.kill(pid, "SIGTERM");
+			process.kill(pid, signal);
 		} catch {
 			// Already gone.
 		}
 	}
+}
+
+/**
+ * Stop a process tree not owned by this Pi process. On Linux, delayed SIGKILL
+ * targets only the original process-group members whose PID start time still
+ * matches. Other platforms avoid a delayed PID-only kill that could hit a
+ * reused PID.
+ */
+export function killPidTree(pid: number, expectedStartTime?: string): void {
+	if (process.platform === "win32") {
+		spawn("taskkill", ["/pid", String(pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+		return;
+	}
+	const leader = readProcessIdentity(pid);
+	if (expectedStartTime && leader?.startTime !== expectedStartTime) return;
+	const members = processGroupSnapshot(pid);
+	signalPidTree(pid, "SIGTERM");
+	if (members.length === 0) return;
 	setTimeout(() => {
-		try {
-			process.kill(-pid, "SIGKILL");
-		} catch {
+		for (const member of members) {
+			if (!sameProcess(member)) continue;
 			try {
-				process.kill(pid, "SIGKILL");
+				process.kill(member.pid, "SIGKILL");
 			} catch {
 				// Already gone.
 			}
@@ -174,25 +248,105 @@ export function killPidTree(pid: number): void {
 	}, 3000).unref();
 }
 
+function waitTimeout(ms: number): Promise<void> {
+	return new Promise((resolveWait) => {
+		const timer = setTimeout(resolveWait, ms);
+		timer.unref();
+	});
+}
+
+function ownChild(runId: string, child: ChildProcessWithoutNullStreams): OwnedChild {
+	const pid = child.pid;
+	if (!pid) throw new Error("Subagent process started without a PID");
+	let closed = false;
+	let resolveClosed!: () => void;
+	const closedPromise = new Promise<void>((resolve) => {
+		resolveClosed = resolve;
+	});
+	child.once("close", () => {
+		closed = true;
+		resolveClosed();
+	});
+	const identity = readProcessIdentity(pid);
+	let terminating: Promise<void> | undefined;
+	const owned: OwnedChild = {
+		pid,
+		closed: closedPromise,
+		terminate() {
+			if (terminating) return terminating;
+			terminating = (async () => {
+				if (process.platform === "win32") {
+					spawn("taskkill", ["/pid", String(pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+				} else {
+					signalPidTree(pid, "SIGTERM");
+					const timer = setTimeout(() => {
+						if (
+							!closed &&
+							child.exitCode === null &&
+							child.signalCode === null &&
+							(!identity || sameProcess(identity))
+						) {
+							signalPidTree(pid, "SIGKILL");
+						}
+					}, 3000);
+					timer.unref();
+					closedPromise.finally(() => clearTimeout(timer));
+				}
+				await Promise.race([closedPromise, waitTimeout(TERMINATION_WAIT_MS)]);
+			})();
+			return terminating;
+		},
+	};
+	ownedChildren.set(runId, owned);
+	closedPromise.finally(() => {
+		if (ownedChildren.get(runId) === owned) ownedChildren.delete(runId);
+	});
+	return owned;
+}
+
 /** Force-cancel a running or queued child and all of its descendants. */
 export function cancelSubagent(agentDir: string, record: AgentRecord): AgentRecord {
 	const cancelOne = (item: AgentRecord): AgentRecord => {
-		if (item.pid && isProcessAlive(item.pid)) killPidTree(item.pid);
-		const updated: AgentRecord = {
-			...item,
-			status: "cancelled",
-			activity: "cancelled",
-			error: item.error ?? "Cancelled",
-			finishedAt: item.finishedAt ?? new Date().toISOString(),
-			updatedAt: new Date().toISOString(),
-		};
-		saveRecord(agentDir, updated);
+		let updated!: AgentRecord;
+		let pid: number | undefined;
+		let owned: OwnedChild | undefined;
+		withRecordLock(agentDir, item.runId, () => {
+			const latest = readRecords(agentDir).find((candidate) => candidate.runId === item.runId) ?? item;
+			const now = new Date().toISOString();
+			updated = saveRecord(agentDir, {
+				...latest,
+				status: "cancelled",
+				activity: "cancelled",
+				currentTool: undefined,
+				error: latest.error ?? "Cancelled",
+				finishedAt: latest.finishedAt ?? now,
+				updatedAt: now,
+			});
+			owned = ownedChildren.get(item.runId);
+			pid = updated.pid;
+			runAbortControllers.get(item.runId)?.abort();
+		});
+		if (owned) void owned.terminate();
+		else if (pid && isProcessAlive(pid)) killPidTree(pid, updated.pidStartTime);
 		return updated;
 	};
 	for (const child of descendantsOf(readRecords(agentDir), record.runId).reverse()) {
 		if (!isTerminalStatus(child.status)) cancelOne(child);
 	}
 	return cancelOne(record);
+}
+
+/** Stop and await children owned by this process. Queued run loops also drain. */
+export async function terminateOwnedSubagents(runIds: readonly string[]): Promise<void> {
+	const ids = new Set(runIds);
+	const terminations: Promise<void>[] = [];
+	for (const runId of ids) {
+		const owned = ownedChildren.get(runId);
+		if (owned) terminations.push(owned.terminate());
+	}
+	await Promise.all(terminations);
+	const runs = [...ids].map((runId) => childRuns.get(runId)).filter((run): run is Promise<void> => !!run);
+	await Promise.race([Promise.all(runs).then(() => {}), waitTimeout(TERMINATION_WAIT_MS)]);
 }
 
 async function findSessionFile(cwd: string, sessionId: string): Promise<string | undefined> {
@@ -248,25 +402,42 @@ export async function startSubagent(input: SpawnAgentInput, context: SpawnContex
 		startedAt: now,
 		updatedAt: now,
 	};
-	saveRecord(context.agentDir, record);
+	Object.assign(record, saveRecord(context.agentDir, record));
 	context.onRecord?.(record);
 
 	startingChildren.set(record.runId, { messages: [] });
-	void runSubagentProcess(input, context, record)
+	const runAbort = new AbortController();
+	runAbortControllers.set(record.runId, runAbort);
+	if (context.signal) {
+		const abortRun = () => runAbort.abort();
+		if (context.signal.aborted) runAbort.abort();
+		else context.signal.addEventListener("abort", abortRun, { once: true });
+	}
+	const run = runSubagentProcess(input, context, record, runAbort.signal)
 		.catch((error) => {
+			if (isRecordCancelled(context.agentDir, record.runId)) {
+				const onDisk = readRecords(context.agentDir).find((candidate) => candidate.runId === record.runId);
+				if (onDisk) Object.assign(record, onDisk);
+				return;
+			}
 			if (isTerminalStatus(record.status)) return;
 			record.status = "failed";
 			record.activity = "failed";
 			record.error = error instanceof Error ? error.message : String(error);
 			record.finishedAt = record.finishedAt ?? new Date().toISOString();
 			record.updatedAt = record.finishedAt;
-			saveRecord(context.agentDir, record);
+			Object.assign(record, saveRecord(context.agentDir, record));
 			context.onRecord?.(record);
 			context.onSettled?.(record);
 		})
 		.finally(() => {
+			if (runAbortControllers.get(record.runId) === runAbort) runAbortControllers.delete(record.runId);
 			startingChildren.delete(record.runId);
 		});
+	childRuns.set(record.runId, run);
+	void run.finally(() => {
+		if (childRuns.get(record.runId) === run) childRuns.delete(record.runId);
+	});
 	return record;
 }
 
@@ -274,15 +445,19 @@ async function runSubagentProcess(
 	input: SpawnAgentInput,
 	context: SpawnContext,
 	record: AgentRecord,
+	runSignal: AbortSignal,
 ): Promise<void> {
 	let release: (() => void) | undefined;
 	let flushTimer: ReturnType<typeof setTimeout> | undefined;
 	const publish = () => {
-		saveRecord(context.agentDir, record);
+		Object.assign(record, saveRecord(context.agentDir, record));
 		context.onRecord?.(record);
 	};
-	const diskCancelled = () =>
-		readRecords(context.agentDir).find((r) => r.runId === record.runId)?.status === "cancelled";
+	const publishClosed = () => {
+		Object.assign(record, clearRecordPid(context.agentDir, record));
+		context.onRecord?.(record);
+	};
+	const diskCancelled = () => isRecordCancelled(context.agentDir, record.runId);
 	const schedulePublish = (immediate = false) => {
 		if (immediate) {
 			if (flushTimer) clearTimeout(flushTimer);
@@ -299,6 +474,7 @@ async function runSubagentProcess(
 		}
 	};
 	const settle = (status: AgentRecord["status"], detail?: string) => {
+		if (diskCancelled()) status = "cancelled";
 		record.status = status;
 		record.activity = status;
 		record.currentTool = undefined;
@@ -310,7 +486,7 @@ async function runSubagentProcess(
 	};
 
 	try {
-		release = await gate.acquire(context.settings.maxConcurrency, context.signal);
+		release = await gate.acquire(context.settings.maxConcurrency, runSignal);
 		if (record.status === "cancelled" || diskCancelled()) return;
 
 		const systemPrompt = `You are subagent "${record.name}" at depth ${record.depth}/${record.maxDepth}. Complete delegated tasks and return concise, self-contained results.`;
@@ -359,24 +535,32 @@ async function runSubagentProcess(
 		const stdoutLineLimit = Math.max(1, context.stdoutLineLimit ?? STDOUT_LINE_LIMIT);
 
 		const invocation = getPiInvocation(args);
-		const child = spawn(invocation.command, invocation.args, {
-			cwd: record.cwd,
-			detached: process.platform !== "win32",
-			shell: false,
-			stdio: ["pipe", "pipe", "pipe"],
-			env: {
-				...process.env,
-				PI_SUBAGENT_RUN_ID: record.runId,
-				PI_SUBAGENT_PARENT_ID: context.parentRunId,
-				PI_SUBAGENT_ROOT_ID: context.rootRunId,
-				PI_SUBAGENT_DEPTH: String(record.depth),
-				PI_SUBAGENT_MAX_DEPTH: String(context.settings.maxDepth),
-			},
+		let child: ChildProcessWithoutNullStreams | undefined;
+		withRecordLock(context.agentDir, record.runId, () => {
+			if (diskCancelled()) return;
+			child = spawn(invocation.command, invocation.args, {
+				cwd: record.cwd,
+				detached: process.platform !== "win32",
+				shell: false,
+				stdio: ["pipe", "pipe", "pipe"],
+				env: {
+					...process.env,
+					PI_SUBAGENT_RUN_ID: record.runId,
+					PI_SUBAGENT_PARENT_ID: context.parentRunId,
+					PI_SUBAGENT_ROOT_ID: context.rootRunId,
+					PI_SUBAGENT_DEPTH: String(record.depth),
+					PI_SUBAGENT_MAX_DEPTH: String(context.settings.maxDepth),
+				},
+			});
+			ownChild(record.runId, child);
+			record.pid = child.pid;
+			record.pidStartTime = child.pid ? readProcessIdentity(child.pid)?.startTime : undefined;
+			record.status = "starting";
+			record.activity = "starting";
+			publish();
 		});
-		record.pid = child.pid;
-		record.status = "starting";
-		record.activity = "starting";
-		publish();
+		if (!child) return;
+		const launchedChild = child;
 
 		const cleanupPending = (request: PendingRequest) => {
 			clearTimeout(request.timer);
@@ -394,11 +578,13 @@ async function runSubagentProcess(
 			transportError = error.message;
 			rejectPending(error);
 			if (closing) return;
-			child.stdin.destroy();
-			if (record.pid && isProcessAlive(record.pid)) killPidTree(record.pid);
+			launchedChild.stdin.destroy();
+			const owned = ownedChildren.get(record.runId);
+			if (owned) void owned.terminate();
+			else if (record.pid && isProcessAlive(record.pid)) killPidTree(record.pid, record.pidStartTime);
 		};
 		const writeLine = (value: Record<string, unknown>, id?: string) => {
-			if (child.stdin.destroyed || child.stdin.writableEnded) {
+			if (launchedChild.stdin.destroyed || launchedChild.stdin.writableEnded) {
 				const error = new Error("Subagent RPC stdin is not writable");
 				if (id) {
 					const request = pending.get(id);
@@ -412,7 +598,7 @@ async function runSubagentProcess(
 				return;
 			}
 			try {
-				child.stdin.write(`${JSON.stringify(value)}\n`, "utf8", (error) => {
+				launchedChild.stdin.write(`${JSON.stringify(value)}\n`, "utf8", (error) => {
 					if (error) failTransport(error);
 				});
 			} catch (error) {
@@ -536,7 +722,7 @@ async function runSubagentProcess(
 					initialSettled = true;
 					resolveInitial();
 				}
-				if (context.persistAfterSettled === false) child.stdin.end();
+				if (context.persistAfterSettled === false) launchedChild.stdin.end();
 				return;
 			}
 			schedulePublish(important);
@@ -563,14 +749,14 @@ async function runSubagentProcess(
 				processLine(line);
 			}
 		};
-		child.stdout.on("data", (chunk: Buffer) => {
+		launchedChild.stdout.on("data", (chunk: Buffer) => {
 			consumeStdout(stdoutDecoder.write(chunk));
 		});
-		child.stderr.on("data", (chunk: Buffer) => {
+		launchedChild.stderr.on("data", (chunk: Buffer) => {
 			stderr = `${stderr}${stderrDecoder.write(chunk)}`.slice(-STDERR_LIMIT);
 		});
-		child.stdin.on("error", (error) => failTransport(error));
-		child.on("close", (code) => {
+		launchedChild.stdin.on("error", (error) => failTransport(error));
+		launchedChild.on("close", (code) => {
 			closing = true;
 			liveChildren.delete(record.runId);
 			for (const releaseTurn of continuationReleases.splice(0)) releaseTurn();
@@ -580,29 +766,42 @@ async function runSubagentProcess(
 			const exitError = new Error(transportError || stderr.trim() || `Subagent exited with code ${code ?? 1}`);
 			rejectPending(exitError);
 			const wasCancelled = record.status === "cancelled" || diskCancelled();
-			record.pid = undefined;
-			if (!wasCancelled && !isTerminalStatus(record.status)) {
-				settle("failed", exitError.message);
+			if (wasCancelled) {
+				const onDisk = readRecords(context.agentDir).find((candidate) => candidate.runId === record.runId);
+				if (onDisk) Object.assign(record, onDisk);
 			}
+			let newlySettled = false;
+			if (!wasCancelled && !isTerminalStatus(record.status)) {
+				record.status = "failed";
+				record.activity = "failed";
+				record.currentTool = undefined;
+				record.error = exitError.message;
+				record.finishedAt = new Date().toISOString();
+				record.updatedAt = record.finishedAt;
+				newlySettled = true;
+			}
+			record.pid = undefined;
+			publishClosed();
+			if (newlySettled) context.onSettled?.(record);
 			if (!initialSettled) {
 				initialSettled = true;
 				resolveInitial();
 			}
 		});
-		child.on("error", (error) => {
+		launchedChild.on("error", (error) => {
 			stderr = `${stderr}\n${error.message}`.slice(-STDERR_LIMIT);
 			failTransport(error);
 		});
 
 		try {
-			const stateResponse = await send({ type: "get_state" }, { signal: context.signal, deadline: startupDeadline });
+			const stateResponse = await send({ type: "get_state" }, { signal: runSignal, deadline: startupDeadline });
 			if (typeof stateResponse.data?.sessionFile === "string") {
 				record.sessionFile = stateResponse.data.sessionFile;
 				publish();
 			} else {
 				record.sessionFile = await findSessionFile(record.cwd, record.runId);
 			}
-			await send({ type: "prompt", message: input.task }, { signal: context.signal, deadline: startupDeadline });
+			await send({ type: "prompt", message: input.task }, { signal: runSignal, deadline: startupDeadline });
 			const startup = startingChildren.get(record.runId);
 			liveChildren.set(record.runId, liveChild);
 			startingChildren.delete(record.runId);
@@ -611,10 +810,9 @@ async function runSubagentProcess(
 			}
 			await initialDone;
 		} catch (error) {
-			child.stdin.end();
-			setTimeout(() => {
-				if (record.pid && isProcessAlive(record.pid)) killPidTree(record.pid);
-			}, 1000).unref();
+			launchedChild.stdin.end();
+			const owned = ownedChildren.get(record.runId);
+			if (owned) void owned.terminate();
 			throw error;
 		}
 	} finally {

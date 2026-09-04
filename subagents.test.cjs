@@ -1,6 +1,6 @@
 // Regression tests for the subagents extension. No dependencies, no API calls.
 // Run: node subagents.test.cjs
-const { execSync } = require("node:child_process");
+const { execSync, spawn: spawnProcess } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -285,9 +285,23 @@ function check(name, cond, extra) {
 	check("control inbox consumes once", control.consumeSubagentMessages(agentDir2, "child1", "root").length === 0);
 	registry.saveRecord(agentDir2, mk("child1", "root", { status: "thinking" }));
 	registry.saveRecord(agentDir2, mk("grand", "child1", { status: "running_tool" }));
-	spawn.cancelSubagent(agentDir2, registry.readRecords(agentDir2).find((r) => r.runId === "child1"));
+	const child1StaleWriter = registry.readRecords(agentDir2).find((r) => r.runId === "child1");
+	spawn.cancelSubagent(agentDir2, child1StaleWriter);
 	const cancelledTree = registry.readRecords(agentDir2);
 	check("cancelling parent cancels descendants", ["child1", "grand"].every((id) => cancelledTree.find((r) => r.runId === id)?.status === "cancelled"));
+	fs.writeFileSync(
+		path.join(agentDir2, "subagents", "runs", "child1.json"),
+		`${JSON.stringify({ ...child1StaleWriter, status: "completed", latestText: "stale completion" })}\n`,
+	);
+	const monotonicCancel = registry.readRecords(agentDir2).find((r) => r.runId === "child1");
+	check("stale record writer cannot undo cancellation", monotonicCancel?.status === "cancelled", monotonicCancel?.status);
+	registry.clearRecordPid(agentDir2, { ...monotonicCancel, pid: 2147483647 });
+	fs.writeFileSync(
+		path.join(agentDir2, "subagents", "runs", "child1.json"),
+		`${JSON.stringify({ ...monotonicCancel, pid: 2147483647 })}\n`,
+	);
+	const clearedPid = registry.readRecords(agentDir2).find((r) => r.runId === "child1")?.pid;
+	check("stale record writer cannot restore cleared PID", clearedPid === undefined, String(clearedPid));
 	registry.saveRecord(agentDir2, mk("stale", "root", { status: "running_tool", pid: 2147483647 }));
 	const stale = registry.readRecords(agentDir2).find((r) => r.runId === "stale");
 	check("dead pid reconciled to failed", stale && stale.status === "failed", stale && stale.status);
@@ -578,12 +592,23 @@ function check(name, cond, extra) {
 	const slowRec = await spawn.startSubagent({ task: "slow", name: "slowpoke" }, { ...baseCtx() });
 	const cancelled = spawn.cancelSubagent(spawnAgentDir, slowRec);
 	check("cancel marks cancelled", cancelled.status === "cancelled", cancelled.status);
-	let slowGone = false;
-	for (let i = 0; i < 50; i++) {
-		if (!slowRec.pid || !registry.isProcessAlive(slowRec.pid)) { slowGone = true; break; }
-		await new Promise((r) => setTimeout(r, 100));
+	await spawn.terminateOwnedSubagents([slowRec.runId]);
+	const closedSlow = registry.readRecords(spawnAgentDir).find((r) => r.runId === slowRec.runId);
+	check("owned cancellation waits for child exit", !registry.isProcessAlive(slowRec.pid), String(slowRec.pid));
+	check("child close persists PID clearing", closedSlow?.pid === undefined, String(closedSlow?.pid));
+
+	if (process.platform === "linux") {
+		const pidProbe = spawnProcess(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+			detached: true,
+			stdio: "ignore",
+		});
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		spawn.killPidTree(pidProbe.pid, "not-the-recorded-start-time");
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		check("PID identity mismatch prevents stale-record kill", registry.isProcessAlive(pidProbe.pid), String(pidProbe.pid));
+		try { process.kill(-pidProbe.pid, "SIGTERM"); } catch { pidProbe.kill("SIGTERM"); }
+		await new Promise((resolve) => pidProbe.once("close", resolve));
 	}
-	check("cancelled child process exits", slowGone, String(slowRec.pid));
 
 	// queued when the gate is full
 	const held = await spawn.gate.acquire(1);
@@ -624,6 +649,22 @@ function check(name, cond, extra) {
 		abortQueuedFinal?.pid === undefined && !abortQueuedFinal?.latestText && String(abortQueuedFinal?.error || "").includes("aborted"),
 		JSON.stringify(abortQueuedFinal),
 	);
+
+	const heldForCancel = await spawn.gate.acquire(1);
+	const cancelledQueued = await spawn.startSubagent(
+		{ task: "must not launch", name: "cancelled-queued" },
+		{ ...baseCtx(), settings: { maxDepth: 2, maxConcurrency: 1 } },
+	);
+	spawn.cancelSubagent(spawnAgentDir, cancelledQueued);
+	let queuedCancelDrained = false;
+	await Promise.race([
+		spawn.terminateOwnedSubagents([cancelledQueued.runId]).then(() => { queuedCancelDrained = true; }),
+		new Promise((resolve) => setTimeout(resolve, 500)),
+	]);
+	check("queued cancellation removes gate waiter", queuedCancelDrained);
+	heldForCancel();
+	const cancelledQueuedFinal = registry.readRecords(spawnAgentDir).find((r) => r.runId === cancelledQueued.runId);
+	check("queued cancellation wins launch race", cancelledQueuedFinal?.status === "cancelled" && cancelledQueuedFinal.pid === undefined && !cancelledQueuedFinal.latestText, JSON.stringify(cancelledQueuedFinal));
 
 	// --- cancel race: a cancelled child must stay cancelled, not flip to failed ---
 	process.env.FAKE_DELAY_MS = "4000";
