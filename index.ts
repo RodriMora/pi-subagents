@@ -62,6 +62,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	let panel: SubagentPanel | undefined;
 	let mainModel: string | undefined;
 	let deliveryTimer: ReturnType<typeof setTimeout> | undefined;
+	let deliveryRetryDelay = 1000;
 	let keepAlive: ReturnType<typeof setInterval> | undefined;
 	let inboxTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -83,28 +84,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	};
 
 	/** Deliver finished-but-undelivered child results to this session, debounced so parallel finishes batch into one message. */
-	const scheduleDelivery = () => {
+	const scheduleDelivery = (delay = 1000) => {
 		if (deliveryTimer) return;
-		deliveryTimer = setTimeout(() => {
+		deliveryTimer = setTimeout(async () => {
 			deliveryTimer = undefined;
 			try {
-				deliverResults();
+				await deliverResults();
+				deliveryRetryDelay = 1000;
 			} catch {
-				// Delivery is best-effort; the registry keeps the results either way.
+				// Keep the result unclaimed and back off while this session is alive.
+				const retryDelay = deliveryRetryDelay;
+				deliveryRetryDelay = Math.min(deliveryRetryDelay * 2, 30000);
+				scheduleDelivery(retryDelay);
 			}
-		}, 1000);
+		}, delay);
 		deliveryTimer.unref?.();
 	};
 
-	const deliverResults = () => {
+	const deliverResults = async () => {
 		if (!runtime) return;
 		const agentDir = getAgentDir();
 		const children = readRecords(agentDir).filter((record) => record.parentRunId === runtime!.runId);
 		const pending = children.filter((record) => isTerminalStatus(record.status) && !record.resultsDelivered);
 		if (pending.length === 0) return;
-		for (const record of pending) {
-			saveRecord(agentDir, { ...record, resultsDelivered: true, updatedAt: new Date().toISOString() });
-		}
 		const stillRunning = children.filter((record) => !isTerminalStatus(record.status)).length;
 		const parts = pending.map((record) => {
 			const head = `### ${record.name} — ${record.status}`;
@@ -127,6 +129,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			},
 			{ triggerTurn: true, deliverAs: "followUp" },
 		);
+		for (const record of pending) {
+			try {
+				saveRecord(agentDir, { ...record, resultsDelivered: true, updatedAt: new Date().toISOString() });
+			} catch {
+				// The message was accepted. Do not resend it in a tight loop when claim persistence fails.
+			}
+		}
 	};
 
 	pi.registerFlag("subagent-depth", {
@@ -355,7 +364,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					currentDepth: runtime.depth,
 					settings: runtime.settings,
 					parentModel,
-					parentThinking: ctx.thinkingLevel,
+					parentThinking: ctx.thinkingLevel ?? "off",
 					parentCwd: ctx.cwd,
 					projectTrusted: runtime.projectTrusted,
 					persistAfterSettled: ctx.mode === "tui" || ctx.mode === "rpc",
@@ -402,7 +411,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			return new Text(`${theme.fg("toolTitle", theme.bold("spawn_agent"))} ${theme.fg("accent", name)}${theme.fg("dim", model)}`, 0, 0);
 		},
 		renderResult(result, _options, theme) {
-			const record = result.details?.record;
+			const record = (result.details as { record?: AgentRecord } | undefined)?.record;
 			if (!record) {
 				const text = result.content[0];
 				return new Text(text?.type === "text" ? text.text : "", 0, 0);
@@ -439,9 +448,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			// Refresh before claiming results so auto-delivery that happened while
 			// waiting is not repeated by this check.
 			rows = snapshot();
-			// Only terminal results not already delivered are shown. Marking them
-			// delivered also prevents the automatic path from injecting them again.
-			const newlyFinished = rows.filter((record) => isTerminalStatus(record.status) && !record.resultsDelivered);
+			// This session owns delivery only for its direct children. Descendant
+			// results remain visible, but their direct parent must claim them.
+			const newlyFinished = rows.filter(
+				(record) => record.parentRunId === runtime!.runId && isTerminalStatus(record.status) && !record.resultsDelivered,
+			);
 			for (const record of newlyFinished) {
 				saveRecord(agentDir, { ...record, resultsDelivered: true, updatedAt: new Date().toISOString() });
 			}
@@ -451,9 +462,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			const running = rows.filter((record) => !isTerminalStatus(record.status));
 			const newlyFinishedIds = new Set(newlyFinished.map((record) => record.runId));
 			const sections = rows
-				.filter((record) => !isTerminalStatus(record.status) || newlyFinishedIds.has(record.runId))
+				.filter(
+					(record) =>
+						!isTerminalStatus(record.status) ||
+						newlyFinishedIds.has(record.runId) ||
+						(record.parentRunId !== runtime!.runId && !record.resultsDelivered),
+				)
 				.map((record) => {
-					const meta = `${record.model} · depth ${record.depth}/${record.maxDepth} · ${record.cwd}${record.runId ? ` · run ${shortId(record.runId)}` : ""}`;
+					const readOnly = record.parentRunId !== runtime!.runId ? " · read-only descendant" : "";
+					const meta = `${record.model} · depth ${record.depth}/${record.maxDepth} · ${record.cwd}${record.runId ? ` · run ${shortId(record.runId)}` : ""}${readOnly}`;
 					let body: string;
 					if (isTerminalStatus(record.status)) {
 						body =
