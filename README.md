@@ -26,7 +26,7 @@ Install from npm with Pi:
 pi install npm:@williamcr01/pi-subagents
 ```
 
-Restart Pi or run `/reload` after installing. To install the latest published version explicitly:
+This version requires Pi 0.83.0 or newer. Restart Pi or run `/reload` after installing. To install the latest published version explicitly:
 
 ```sh
 pi update npm:@williamcr01/pi-subagents
@@ -81,6 +81,10 @@ Optional fields are `name`, `cwd`, `model`, `thinking`, and an exact `tools` all
 1. Per-spawn `model`
 2. `defaultModel` in configuration
 3. The creating agent's active model
+
+When the creating session has a model scope from Pi's `--models` flag or `enabledModels` setting, the selected child model must be in that scope. The scope and its pinned thinking levels are passed to the child, so descendants cannot escape it. An empty scope keeps Pi's unrestricted model behavior.
+
+Omitting `tools` copies the creating session's active tool set. An explicit list can only remove tools from that set, and `tools: []` starts the child with `--no-tools`. Include `spawn_agent` to allow recursive delegation. A child receives it automatically only when `spawn_agent` is active in the parent and `tools` is omitted or explicitly includes it.
 
 Thinking level follows the same precedence and is clamped to the selected child model.
 

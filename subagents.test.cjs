@@ -22,7 +22,7 @@ const jiti = createJiti(__filename, {
 	fsCache: false,
 	moduleCache: false,
 	alias: {
-		"@earendil-works/pi-coding-agent": path.join(PI, "dist", "index.js"),
+		"@earendil-works/pi-coding-agent": path.join(PI, "dist", "bundle", "index.js"),
 		"@earendil-works/pi-tui": path.join(PIN, "@earendil-works", "pi-tui", "dist", "index.js"),
 		typebox: require.resolve("typebox", { paths: [PI] }),
 	},
@@ -212,6 +212,33 @@ function check(name, cond, extra) {
 	check("second acquire resolves after release", secondResolved === true);
 	r2();
 
+	// --- capability narrowing ---
+	const inheritedTools = spawn.resolveChildTools(undefined, ["read", "spawn_agent", "read"]);
+	check("omitted tools inherit active tools", JSON.stringify(inheritedTools) === JSON.stringify(["read", "spawn_agent"]), JSON.stringify(inheritedTools));
+	const narrowedTools = spawn.resolveChildTools(["read"], ["read", "bash", "spawn_agent"]);
+	check("explicit tools may narrow active tools", JSON.stringify(narrowedTools) === JSON.stringify(["read"]), JSON.stringify(narrowedTools));
+	check("explicit empty tools stays empty", spawn.resolveChildTools([], ["read", "spawn_agent"]).length === 0);
+	for (const [label, tools] of [["blank", ["  "]], ["surrounding whitespace", [" read"]], ["comma", ["read,bash"]], ["control", ["read\n"]]]) {
+		let threw = false;
+		try { spawn.resolveChildTools(tools, ["read", "bash"]); } catch { threw = true; }
+		check(`${label} tool name rejected`, threw);
+	}
+	let escalationThrew = false;
+	try { spawn.resolveChildTools(["read", "write"], ["read"]); } catch (error) { escalationThrew = String(error).includes("subset"); }
+	check("explicit tools cannot add a parent-inactive tool", escalationThrew);
+	const safeSubset = spawn.resolveChildTools(["read"], ["read", "bad,parent-tool"]);
+	check("excluded unserializable parent tool does not block a subset", JSON.stringify(safeSubset) === JSON.stringify(["read"]), JSON.stringify(safeSubset));
+	check("empty model scope keeps legacy model selection", spawn.resolveChildModel("fuzzy-model", []) === "fuzzy-model");
+	const modelScope = [{ provider: "one", id: "shared" }, { provider: "two", id: "other" }];
+	check("scoped bare model canonicalized", spawn.resolveChildModel("OTHER", modelScope) === "two/other");
+	check("scoped canonical model matching ignores case", spawn.resolveChildModel("TWO/OTHER", modelScope) === "two/other");
+	let modelScopeThrew = false;
+	try { spawn.resolveChildModel("outside", modelScope); } catch (error) { modelScopeThrew = String(error).includes("outside"); }
+	check("out-of-scope child model rejected", modelScopeThrew);
+	let ambiguousModelThrew = false;
+	try { spawn.resolveChildModel("shared", [...modelScope, { provider: "three", id: "shared" }]); } catch (error) { ambiguousModelThrew = String(error).includes("ambiguous"); }
+	check("ambiguous bare scoped model rejected", ambiguousModelThrew);
+
 	// --- panel ---
 	const piRoot = await jiti.import("@earendil-works/pi-coding-agent");
 	piRoot.initTheme("dark");
@@ -284,10 +311,40 @@ function check(name, cond, extra) {
 		settings: { maxDepth: 2, maxConcurrency: -1 },
 		parentModel: "fake/parent",
 		parentThinking: "off",
+		parentTools: ["read", "spawn_agent"],
+		scopedModels: [],
 		parentCwd: spawnDir,
 		projectTrusted: false,
 	});
 	process.env.PI_SUBAGENT_COMMAND = fakePi;
+	const fakeArgsDir = path.join(sandbox, "fake-args");
+	process.env.FAKE_ARGS_DIR = fakeArgsDir;
+
+	let requestedModelThrew = false;
+	try {
+		await spawn.startSubagent({ task: "x", model: "fake/outside" }, { ...baseCtx(), scopedModels: [{ provider: "fake", id: "allowed" }] });
+	} catch (error) {
+		requestedModelThrew = String(error).includes("outside");
+	}
+	check("requested child model must be in nonempty parent scope", requestedModelThrew);
+	let defaultModelThrew = false;
+	try {
+		await spawn.startSubagent(
+			{ task: "x" },
+			{ ...baseCtx(), settings: { ...baseCtx().settings, defaultModel: "fake/outside" }, scopedModels: [{ provider: "fake", id: "allowed" }] },
+		);
+	} catch (error) {
+		defaultModelThrew = String(error).includes("outside");
+	}
+	check("configured default child model must be in nonempty parent scope", defaultModelThrew);
+	let inheritedModelThrew = false;
+	try {
+		await spawn.startSubagent({ task: "x" }, { ...baseCtx(), scopedModels: [{ provider: "fake", id: "allowed" }] });
+	} catch (error) {
+		inheritedModelThrew = String(error).includes("outside");
+	}
+	check("inherited child model must be in nonempty parent scope", inheritedModelThrew);
+	check("capability validation fails before saving a run", registry.readRecords(spawnAgentDir).length === 0, registry.readRecords(spawnAgentDir).length);
 
 	const t0 = Date.now();
 	const settled = [];
@@ -303,8 +360,43 @@ function check(name, cond, extra) {
 	check("background child completes", polled && polled.status === "completed", polled && polled.status);
 	check("fake output captured", polled && polled.latestText === "fake done", polled && polled.latestText);
 	check("usage captured", polled && polled.usage.input === 10, polled && JSON.stringify(polled.usage));
+	const inheritedArgs = JSON.parse(fs.readFileSync(path.join(fakeArgsDir, `${rec1.runId}.json`), "utf8"));
+	check("omitted tools become a child CLI allowlist", inheritedArgs[inheritedArgs.indexOf("--tools") + 1] === "read,spawn_agent", JSON.stringify(inheritedArgs));
+	check("recursive spawn inherited when active", inheritedArgs.includes("spawn_agent") || inheritedArgs.includes("read,spawn_agent"), JSON.stringify(inheritedArgs));
+	check("empty model scope emits no --models flag", !inheritedArgs.includes("--models"), JSON.stringify(inheritedArgs));
 	await new Promise((r) => setTimeout(r, 250));
 	check("onSettled fired", settled.includes("completed"), JSON.stringify(settled));
+
+	const noToolsRec = await spawn.startSubagent({ task: "none", tools: [] }, baseCtx());
+	for (let i = 0; i < 100; i++) {
+		const row = registry.readRecords(spawnAgentDir).find((r) => r.runId === noToolsRec.runId);
+		if (row && ["completed", "failed"].includes(row.status)) break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	const noToolsArgs = JSON.parse(fs.readFileSync(path.join(fakeArgsDir, `${noToolsRec.runId}.json`), "utf8"));
+	check("explicit empty tools emits --no-tools", noToolsArgs.includes("--no-tools") && !noToolsArgs.includes("--tools"), JSON.stringify(noToolsArgs));
+
+	const narrowedRec = await spawn.startSubagent({ task: "narrow", tools: ["read"] }, baseCtx());
+	for (let i = 0; i < 100; i++) {
+		const row = registry.readRecords(spawnAgentDir).find((r) => r.runId === narrowedRec.runId);
+		if (row && ["completed", "failed"].includes(row.status)) break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	const narrowedArgs = JSON.parse(fs.readFileSync(path.join(fakeArgsDir, `${narrowedRec.runId}.json`), "utf8"));
+	check("explicit tools remove recursive spawn when excluded", narrowedArgs[narrowedArgs.indexOf("--tools") + 1] === "read", JSON.stringify(narrowedArgs));
+
+	const scopedRec = await spawn.startSubagent(
+		{ task: "scoped", model: "allowed" },
+		{ ...baseCtx(), scopedModels: [{ provider: "fake", id: "allowed", thinkingLevel: "high" }, { provider: "fake", id: "other:variant" }] },
+	);
+	for (let i = 0; i < 100; i++) {
+		const row = registry.readRecords(spawnAgentDir).find((r) => r.runId === scopedRec.runId);
+		if (row && ["completed", "failed"].includes(row.status)) break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	const scopedArgs = JSON.parse(fs.readFileSync(path.join(fakeArgsDir, `${scopedRec.runId}.json`), "utf8"));
+	check("bare scoped child model becomes canonical", scopedArgs[scopedArgs.indexOf("--model") + 1] === "fake/allowed", JSON.stringify(scopedArgs));
+	check("parent model scope propagates to child CLI", scopedArgs[scopedArgs.indexOf("--models") + 1] === "fake/allowed:high,fake/other:variant", JSON.stringify(scopedArgs));
 
 	const steered = await spawn.sendSubagentMessage(polled, "focus on tests");
 	check("live RPC child accepts steering", steered === true);
@@ -451,6 +543,7 @@ function check(name, cond, extra) {
 	navPanel.dispose();
 
 	delete process.env.PI_SUBAGENT_COMMAND;
+	delete process.env.FAKE_ARGS_DIR;
 
 	// --- footer tree: main + nested children ---
 	const agentDir3 = path.join(sandbox, "agent3");
