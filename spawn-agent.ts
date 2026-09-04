@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { validateThinkingLevel } from "./config.ts";
@@ -163,7 +163,13 @@ function ensureDirectory(value: string): string {
 		// Report one stable error below.
 	}
 	if (!valid) throw new Error(`Subagent working directory does not exist: ${cwd}`);
-	return cwd;
+	return realpathSync(cwd);
+}
+
+/** Check canonical path containment without relying on platform-specific separators. */
+export function isWithinDirectory(path: string, directory: string): boolean {
+	const child = relative(directory, path);
+	return child === "" || (!isAbsolute(child) && child !== ".." && !child.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`));
 }
 
 interface ProcessIdentity {
@@ -370,7 +376,8 @@ export async function startSubagent(input: SpawnAgentInput, context: SpawnContex
 	}
 	const queued = gate.isFull(context.settings.maxConcurrency);
 	const runId = randomUUID();
-	const cwd = ensureDirectory(input.cwd ? resolve(context.parentCwd, input.cwd) : context.parentCwd);
+	const parentCwd = ensureDirectory(context.parentCwd);
+	const cwd = ensureDirectory(input.cwd ? resolve(parentCwd, input.cwd) : parentCwd);
 	const model = input.model?.trim() || context.settings.defaultModel || context.parentModel;
 	if (!model) {
 		throw new Error("No subagent model is available; choose a parent model or configure defaultModel");
@@ -504,9 +511,6 @@ async function runSubagentProcess(
 		];
 		if (record.thinking) args.push("--thinking", record.thinking);
 		if (input.tools?.length) args.push("--tools", input.tools.join(","));
-		if (context.projectTrusted && (record.cwd === context.parentCwd || record.cwd.startsWith(`${context.parentCwd}/`))) {
-			args.push("--approve");
-		}
 
 		let stderr = "";
 		let buffer = "";
@@ -534,10 +538,16 @@ async function runSubagentProcess(
 		const startupDeadline = Date.now() + Math.max(1, context.rpcStartupTimeoutMs ?? RPC_STARTUP_TIMEOUT_MS);
 		const stdoutLineLimit = Math.max(1, context.stdoutLineLimit ?? STDOUT_LINE_LIMIT);
 
-		const invocation = getPiInvocation(args);
 		let child: ChildProcessWithoutNullStreams | undefined;
 		withRecordLock(context.agentDir, record.runId, () => {
 			if (diskCancelled()) return;
+			// Re-resolve immediately before spawn so a swapped symlink cannot keep --approve.
+			record.cwd = ensureDirectory(record.cwd);
+			const trustedRoot = ensureDirectory(context.parentCwd);
+			if (context.projectTrusted && isWithinDirectory(record.cwd, trustedRoot)) {
+				args.push("--approve");
+			}
+			const invocation = getPiInvocation(args);
 			child = spawn(invocation.command, invocation.args, {
 				cwd: record.cwd,
 				detached: process.platform !== "win32",

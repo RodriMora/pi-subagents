@@ -59,6 +59,12 @@ check_subagents({ wait: true, timeoutMs: 120000 })
 
 Use `send_to_subagent` to steer a running child or continue a completed one. Use `cancel_subagent` to stop a child. Both accept a run ID, session ID, or exact name.
 
+## Isolation model
+
+Each child has a separate Pi process and session, but it is not an OS sandbox. Children use the same user account, filesystem permissions, environment, and installed extensions as the parent.
+
+A trusted parent passes project approval only when the child's canonical working directory remains inside the parent's canonical directory. A symlink that points outside that tree does not inherit approval, so Pi evaluates trust for the target directory normally.
+
 In TUI mode, press **Down** at the bottom of the editor to open the live subagent panel. Open a transcript, type a message, and press **Enter** to steer or continue that subagent. Use `/subagents` to review finished agents and transcripts.
 
 ## Tools

@@ -6,6 +6,15 @@ const exitCode = Number(process.env.FAKE_EXIT ?? 0);
 const sessionId = process.env.FAKE_SESSION_ID ?? process.env.PI_SUBAGENT_RUN_ID ?? "fake-session";
 const mode = process.env.FAKE_MODE ?? "";
 
+if (process.env.FAKE_ARGS_DIR && process.env.PI_SUBAGENT_RUN_ID) {
+	const fs = require("node:fs");
+	fs.mkdirSync(process.env.FAKE_ARGS_DIR, { recursive: true });
+	fs.writeFileSync(
+		require("node:path").join(process.env.FAKE_ARGS_DIR, `${process.env.PI_SUBAGENT_RUN_ID}.json`),
+		JSON.stringify(process.argv.slice(2)),
+	);
+}
+
 const line = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
 
 let runCount = 0;
