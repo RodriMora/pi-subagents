@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, statSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { applyChildEvent, type ParsedChildState } from "./events.ts";
 import { descendantsOf, isProcessAlive, isTerminalStatus, readRecords, saveRecord } from "./registry.ts";
@@ -127,7 +127,13 @@ function ensureDirectory(value: string): string {
 		// Report one stable error below.
 	}
 	if (!valid) throw new Error(`Subagent working directory does not exist: ${cwd}`);
-	return cwd;
+	return realpathSync(cwd);
+}
+
+/** Check canonical path containment without relying on platform-specific separators. */
+export function isWithinDirectory(path: string, directory: string): boolean {
+	const child = relative(directory, path);
+	return child === "" || (!isAbsolute(child) && child !== ".." && !child.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`));
 }
 
 export function killPidTree(pid: number): void {
@@ -199,7 +205,8 @@ export async function startSubagent(input: SpawnAgentInput, context: SpawnContex
 	}
 	const queued = gate.isFull(context.settings.maxConcurrency);
 	const runId = randomUUID();
-	const cwd = ensureDirectory(input.cwd ? resolve(context.parentCwd, input.cwd) : context.parentCwd);
+	const parentCwd = ensureDirectory(context.parentCwd);
+	const cwd = ensureDirectory(input.cwd ? resolve(parentCwd, input.cwd) : parentCwd);
 	const model = input.model?.trim() || context.settings.defaultModel || context.parentModel;
 	if (!model) {
 		throw new Error("No subagent model is available; choose a parent model or configure defaultModel");
@@ -308,7 +315,8 @@ async function runSubagentProcess(
 		];
 		if (record.thinking) args.push("--thinking", record.thinking);
 		if (input.tools?.length) args.push("--tools", input.tools.join(","));
-		if (context.projectTrusted && (record.cwd === context.parentCwd || record.cwd.startsWith(`${context.parentCwd}/`))) {
+		const trustedRoot = ensureDirectory(context.parentCwd);
+		if (context.projectTrusted && isWithinDirectory(record.cwd, trustedRoot)) {
 			args.push("--approve");
 		}
 

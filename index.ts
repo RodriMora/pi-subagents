@@ -355,7 +355,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					currentDepth: runtime.depth,
 					settings: runtime.settings,
 					parentModel,
-					parentThinking: ctx.thinkingLevel,
+					parentThinking: ctx.thinkingLevel ?? "off",
 					parentCwd: ctx.cwd,
 					projectTrusted: runtime.projectTrusted,
 					persistAfterSettled: ctx.mode === "tui" || ctx.mode === "rpc",
@@ -402,7 +402,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			return new Text(`${theme.fg("toolTitle", theme.bold("spawn_agent"))} ${theme.fg("accent", name)}${theme.fg("dim", model)}`, 0, 0);
 		},
 		renderResult(result, _options, theme) {
-			const record = result.details?.record;
+			const record = (result.details as { record?: AgentRecord } | undefined)?.record;
 			if (!record) {
 				const text = result.content[0];
 				return new Text(text?.type === "text" ? text.text : "", 0, 0);

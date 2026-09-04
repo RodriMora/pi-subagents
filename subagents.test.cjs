@@ -22,7 +22,7 @@ const jiti = createJiti(__filename, {
 	fsCache: false,
 	moduleCache: false,
 	alias: {
-		"@earendil-works/pi-coding-agent": path.join(PI, "dist", "index.js"),
+		"@earendil-works/pi-coding-agent": path.join(PI, "dist", "bundle", "index.js"),
 		"@earendil-works/pi-tui": path.join(PIN, "@earendil-works", "pi-tui", "dist", "index.js"),
 		typebox: require.resolve("typebox", { paths: [PI] }),
 	},
@@ -288,6 +288,35 @@ function check(name, cond, extra) {
 		projectTrusted: false,
 	});
 	process.env.PI_SUBAGENT_COMMAND = fakePi;
+
+	// --- project trust follows canonical paths ---
+	const fakeArgsDir = path.join(sandbox, "trust-args");
+	process.env.FAKE_ARGS_DIR = fakeArgsDir;
+	const internalDir = path.join(spawnDir, "internal");
+	const externalDir = path.join(sandbox, "external-project");
+	const externalLink = path.join(spawnDir, "external-link");
+	fs.mkdirSync(internalDir);
+	fs.mkdirSync(externalDir);
+	fs.symlinkSync(externalDir, externalLink, process.platform === "win32" ? "junction" : "dir");
+	const internalRec = await spawn.startSubagent(
+		{ task: "trusted internal", cwd: internalDir },
+		{ ...baseCtx(), projectTrusted: true, persistAfterSettled: false },
+	);
+	const externalRec = await spawn.startSubagent(
+		{ task: "untrusted symlink", cwd: externalLink },
+		{ ...baseCtx(), projectTrusted: true, persistAfterSettled: false },
+	);
+	for (let i = 0; i < 100; i++) {
+		const rows = registry.readRecords(spawnAgentDir);
+		if ([internalRec, externalRec].every((record) => rows.find((row) => row.runId === record.runId)?.status === "completed")) break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	const internalArgs = JSON.parse(fs.readFileSync(path.join(fakeArgsDir, `${internalRec.runId}.json`), "utf8"));
+	const externalArgs = JSON.parse(fs.readFileSync(path.join(fakeArgsDir, `${externalRec.runId}.json`), "utf8"));
+	check("trusted canonical descendant inherits approval", internalArgs.includes("--approve"), JSON.stringify(internalArgs));
+	check("symlink escape does not inherit approval", !externalArgs.includes("--approve"), JSON.stringify(externalArgs));
+	check("child cwd is canonicalized", externalRec.cwd === fs.realpathSync(externalDir), externalRec.cwd);
+	delete process.env.FAKE_ARGS_DIR;
 
 	const t0 = Date.now();
 	const settled = [];
