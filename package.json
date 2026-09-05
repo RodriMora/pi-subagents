@@ -1,6 +1,6 @@
 {
   "name": "@williamcr01/pi-subagents",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Recursive, isolated, asynchronous subagents for Pi",
   "keywords": [
     "pi-package",
