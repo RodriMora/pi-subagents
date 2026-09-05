@@ -102,7 +102,7 @@ Inspect descendants and collect newly finished results without repeating results
 check_subagents({ wait: true, timeoutMs: 120000 })
 ```
 
-`timeoutMs` defaults to 30 seconds and is capped at 300 seconds.
+`timeoutMs` defaults to 30 seconds and is capped at 300 seconds. The wait returns as soon as every descendant finishes; the timeout is only a maximum.
 
 ### `send_to_subagent`
 
@@ -174,6 +174,7 @@ Source files are organized by responsibility:
 - `index.ts` — Pi registration, lifecycle hooks, tools, delivery, and UI wiring
 - `config.ts` — settings validation and precedence
 - `registry.ts` — atomic run records
+- `wait.ts` — event-driven wait for descendant completion (`check_subagents` wait:true)
 - `spawn-agent.ts` — RPC process control, concurrency, cancellation, and depth enforcement
 - `control.ts` — atomic descendant message inboxes
 - `events.ts` — child JSON event parsing and status updates

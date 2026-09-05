@@ -43,6 +43,7 @@ function check(name, cond, extra) {
 	const events = await jiti.import(path.join(HERE, "events.ts"));
 	const control = await jiti.import(path.join(HERE, "control.ts"));
 	const spawn = await jiti.import(path.join(HERE, "spawn-agent.ts"));
+	const wait = await jiti.import(path.join(HERE, "wait.ts"));
 	const { SubagentPanel } = await jiti.import(path.join(HERE, "panel.ts"));
 	const { default: subagentsExtension } = await jiti.import(path.join(HERE, "index.ts"));
 
@@ -108,6 +109,122 @@ function check(name, cond, extra) {
 	const depths = registry.relativeDepths(all, "root");
 	check("relative depths", depths.get("child1") === 0 && depths.get("grand") === 1, JSON.stringify([...depths]));
 
+	// --- wait ---
+	const waitSleep = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
+	const waitCase = (name) => path.join(sandbox, `wait-${name}`);
+	const waitRecord = (dir, parent, runId, status, extra = {}) =>
+		registry.saveRecord(dir, mk(runId, parent, { rootRunId: parent, status, ...extra }));
+
+	{
+		const dir = waitCase("idle");
+		const started = Date.now();
+		const rows = await wait.waitUntilSubagentsIdle(dir, "parent", { timeoutMs: 5000 });
+		check("wait returns immediately when no children", rows.length === 0 && Date.now() - started < 200, String(Date.now() - started));
+	}
+
+	{
+		const dir = waitCase("already");
+		waitRecord(dir, "parent", "done", "completed");
+		const started = Date.now();
+		const rows = await wait.waitUntilSubagentsIdle(dir, "parent", { timeoutMs: 5000 });
+		check("wait returns immediately when all terminal", rows.length === 1 && Date.now() - started < 200, String(Date.now() - started));
+	}
+
+	{
+		const dir = waitCase("notify");
+		waitRecord(dir, "parent", "live", "thinking");
+		const started = Date.now();
+		const pending = wait.waitUntilSubagentsIdle(dir, "parent", { timeoutMs: 5000, pollMs: 10000 });
+		setTimeout(() => {
+			waitRecord(dir, "parent", "live", "completed", { latestText: "notified" });
+			wait.notifyWaiters(dir);
+		}, 40);
+		const rows = await pending;
+		check("in-process notify wakes wait immediately", Date.now() - started < 500, String(Date.now() - started));
+		check("notify wait sees completed child", rows.some((r) => r.runId === "live" && r.status === "completed"));
+		check("notify wait releases resources", wait.waitDebugState().waiters === 0 && wait.waitDebugState().watches === 0, JSON.stringify(wait.waitDebugState()));
+	}
+
+	{
+		const dir = waitCase("all");
+		waitRecord(dir, "parent", "a", "thinking");
+		waitRecord(dir, "parent", "b", "thinking");
+		let resolved = false;
+		const started = Date.now();
+		const pending = wait.waitUntilSubagentsIdle(dir, "parent", { timeoutMs: 5000, pollMs: 10000 }).then((rows) => {
+			resolved = true;
+			return rows;
+		});
+		await waitSleep(30);
+		waitRecord(dir, "parent", "a", "completed");
+		wait.notifyWaiters(dir);
+		await waitSleep(50);
+		check("wait-for-all stays pending after first child", resolved === false);
+		waitRecord(dir, "parent", "b", "completed");
+		wait.notifyWaiters(dir);
+		await pending;
+		check("wait-for-all returns after last child", resolved && Date.now() - started < 500, String(Date.now() - started));
+	}
+
+	{
+		const dir = waitCase("watch");
+		waitRecord(dir, "parent", "watched", "thinking");
+		const started = Date.now();
+		const pending = wait.waitUntilSubagentsIdle(dir, "parent", { timeoutMs: 3000, pollMs: 10000 });
+		setTimeout(() => {
+			waitRecord(dir, "parent", "watched", "completed");
+		}, 40);
+		await pending;
+		check("fs.watch wakes wait without notify", Date.now() - started < 1500, String(Date.now() - started));
+	}
+
+	{
+		const dir = waitCase("abort");
+		waitRecord(dir, "parent", "abort-me", "thinking");
+		const ac = new AbortController();
+		const pending = wait.waitUntilSubagentsIdle(dir, "parent", { timeoutMs: 5000, signal: ac.signal, pollMs: 10000 });
+		ac.abort();
+		let abortThrew = false;
+		try {
+			await pending;
+		} catch (error) {
+			abortThrew = error instanceof Error && error.message.includes("aborted");
+		}
+		check("abort rejects wait", abortThrew);
+		check("abort releases waiters", wait.waitDebugState().waiters === 0 && wait.waitDebugState().watches === 0, JSON.stringify(wait.waitDebugState()));
+	}
+
+	{
+		const dir = waitCase("zero");
+		waitRecord(dir, "parent", "still-running", "thinking");
+		const started = Date.now();
+		const rows = await wait.waitUntilSubagentsIdle(dir, "parent", { timeoutMs: 0 });
+		check("timeout 0 does not wait", rows.some((r) => r.status === "thinking") && Date.now() - started < 200, String(Date.now() - started));
+	}
+
+	{
+		const dir = waitCase("dead-pid");
+		waitRecord(dir, "parent", "ghost", "thinking", { pid: 2147483647 });
+		const started = Date.now();
+		const rows = await wait.waitUntilSubagentsIdle(dir, "parent", { timeoutMs: 5000 });
+		const ghost = rows.find((r) => r.runId === "ghost");
+		check("dead pid treated as terminal without waiting", ghost && ghost.status === "failed" && Date.now() - started < 200, ghost && `${ghost.status} ${Date.now() - started}`);
+	}
+
+	{
+		const dir = waitCase("dead-while");
+		const child = spawnProcess("sleep", ["30"], { stdio: "ignore" });
+		waitRecord(dir, "parent", "live-pid", "thinking", { pid: child.pid });
+		const started = Date.now();
+		const pending = wait.waitUntilSubagentsIdle(dir, "parent", { timeoutMs: 3000, pollMs: 50 });
+		await waitSleep(20);
+		child.kill("SIGKILL");
+		await new Promise((resolveWait) => child.once("close", resolveWait));
+		const rows = await pending;
+		const live = rows.find((r) => r.runId === "live-pid");
+		check("dead pid during wait is noticed by poll", live && live.status === "failed" && Date.now() - started < 500, live && `${live.status} ${Date.now() - started}`);
+	}
+
 	// --- incremental check results ---
 	const checkAgentDir = path.join(sandbox, "check-agent");
 	fs.mkdirSync(checkAgentDir, { recursive: true });
@@ -150,10 +267,12 @@ function check(name, cond, extra) {
 		const finishTimer = setTimeout(() => {
 			registry.saveRecord(checkAgentDir, checkRecord("second", "completed", { latestText: "second result" }));
 		}, 50);
+		const waitStarted = Date.now();
 		const secondCheck = await checkTool.execute("check-2", { wait: true, timeoutMs: 1000 }, undefined, undefined, {});
 		clearTimeout(finishTimer);
 		const secondText = secondCheck.content[0].text;
 		check("second check returns newly finished result", secondText.includes("second result"), secondText);
+		check("second check returns before timeout once child finishes", Date.now() - waitStarted < 800, String(Date.now() - waitStarted));
 		check("second check omits previously delivered result", !secondText.includes("first result"), secondText);
 		const thirdCheck = await checkTool.execute("check-3", { wait: false }, undefined, undefined, {});
 		const thirdText = thirdCheck.content[0].text;

@@ -13,6 +13,7 @@ import { currentDepth, loadSettings, THINKING_LEVEL_VALUES } from "./config.ts";
 import { consumeSubagentMessages, queueSubagentMessage } from "./control.ts";
 import { SubagentPanel } from "./panel.ts";
 import { isProcessAlive, isTerminalStatus, readRecords, saveRecord } from "./registry.ts";
+import { notifyWaiters, waitUntilSubagentsIdle } from "./wait.ts";
 import {
 	cancelSubagent,
 	killPidTree,
@@ -80,8 +81,8 @@ const SpawnAgentSchema = Type.Object({
 });
 
 const CheckSchema = Type.Object({
-	wait: Type.Optional(Type.Boolean({ description: "Block until every subagent finishes or the timeout elapses" })),
-	timeoutMs: Type.Optional(Type.Integer({ description: "Max wait in ms when wait:true (default 30000, max 300000)" })),
+	wait: Type.Optional(Type.Boolean({ description: "Block until every subagent finishes; returns as soon as they all finish or the timeout elapses" })),
+	timeoutMs: Type.Optional(Type.Integer({ description: "Max wait in ms when wait:true (default 30000, max 300000). Returns sooner if every descendant finishes." })),
 });
 
 const CancelSchema = Type.Object({
@@ -275,6 +276,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 	const trackChild = (record: AgentRecord) => {
 		refreshKeepAlive();
+		notifyWaiters(getAgentDir());
 		if (isTerminalStatus(record.status)) scheduleDelivery();
 	};
 
@@ -466,26 +468,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		name: "check_subagents",
 		label: "Check Subagents",
 		description:
-			"Check the status of this session's subagents and collect newly finished results without repeating ones already delivered. Use wait:true to block until they all finish (or the timeout elapses) before relying on their output.",
+			"Check the status of this session's subagents and collect newly finished results without repeating ones already delivered. Use wait:true to block until they all finish; the call returns as soon as they do, and timeoutMs is only a maximum.",
 		promptSnippet: "Check or wait for background subagent results",
 		parameters: CheckSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (!runtime) throw new Error("Subagent extension settings failed to initialize");
 			const agentDir = getAgentDir();
 			const snapshot = () => descendantsOf(readRecords(agentDir), runtime!.runId);
-			let rows = snapshot();
 			if (params.wait) {
-				const timeout = Math.min(Math.max(params.timeoutMs ?? 30000, 0), 300000);
-				const deadline = Date.now() + timeout;
-				while (rows.some((record) => !isTerminalStatus(record.status)) && Date.now() < deadline) {
-					if (signal?.aborted) throw new Error("check_subagents was aborted");
-					await new Promise((resolveWait) => setTimeout(resolveWait, 250));
-					rows = snapshot();
-				}
+				const timeoutMs = Math.min(Math.max(params.timeoutMs ?? 30000, 0), 300000);
+				await waitUntilSubagentsIdle(agentDir, runtime.runId, { timeoutMs, signal });
 			}
 			// Refresh before claiming results so auto-delivery that happened while
 			// waiting is not repeated by this check.
-			rows = snapshot();
+			const rows = snapshot();
 			// This session owns delivery only for its direct children. Descendant
 			// results remain visible, but their direct parent must claim them.
 			const newlyFinished = rows.filter(
