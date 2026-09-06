@@ -26,7 +26,7 @@ const STDOUT_LINE_LIMIT = 1024 * 1024;
 
 export class ConcurrencyGate {
 	private running = 0;
-	private waiters: Array<{ limit: number; resolve: (release: () => void) => void; reject: (error: Error) => void }> = [];
+	private waiters: Array<{ limit: number; resolve: (release: () => void) => void; cleanup?: () => void }> = [];
 
 	/** True when a spawn with this limit would have to queue. */
 	isFull(limit: number): boolean {
@@ -34,12 +34,13 @@ export class ConcurrencyGate {
 	}
 
 	acquire(limit: number, signal?: AbortSignal): Promise<() => void> {
+		if (signal?.aborted) return Promise.reject(new Error("Subagent was aborted while waiting for a concurrency slot"));
 		if (limit === -1 || this.running < limit) {
 			this.running++;
 			return Promise.resolve(this.releaseOnce());
 		}
 		return new Promise((resolve, reject) => {
-			const waiter = { limit, resolve, reject };
+			const waiter: (typeof this.waiters)[number] = { limit, resolve };
 			this.waiters.push(waiter);
 			if (signal) {
 				const abort = () => {
@@ -47,6 +48,7 @@ export class ConcurrencyGate {
 					if (index >= 0) this.waiters.splice(index, 1);
 					reject(new Error("Subagent was aborted while waiting for a concurrency slot"));
 				};
+				waiter.cleanup = () => signal.removeEventListener("abort", abort);
 				if (signal.aborted) abort();
 				else signal.addEventListener("abort", abort, { once: true });
 			}
@@ -68,6 +70,7 @@ export class ConcurrencyGate {
 			const waiter = this.waiters[index]!;
 			if (waiter.limit !== -1 && this.running >= waiter.limit) continue;
 			this.waiters.splice(index, 1);
+			waiter.cleanup?.();
 			this.running++;
 			waiter.resolve(this.releaseOnce());
 			index--;
@@ -78,6 +81,7 @@ export class ConcurrencyGate {
 export const gate = new ConcurrencyGate();
 
 interface LiveChild {
+	abort(): void;
 	sendMessage(message: string, signal?: AbortSignal): Promise<void>;
 }
 
@@ -413,6 +417,7 @@ export function cancelSubagent(agentDir: string, record: AgentRecord): AgentReco
 			owned = ownedChildren.get(item.runId);
 			pid = updated.pid;
 			runAbortControllers.get(item.runId)?.abort();
+			liveChildren.get(item.runId)?.abort();
 		});
 		if (owned) void owned.terminate();
 		else if (pid && isProcessAlive(pid)) killPidTree(pid, updated.pidStartTime);
@@ -429,6 +434,8 @@ export async function terminateOwnedSubagents(runIds: readonly string[]): Promis
 	const ids = new Set(runIds);
 	const terminations: Promise<void>[] = [];
 	for (const runId of ids) {
+		runAbortControllers.get(runId)?.abort();
+		liveChildren.get(runId)?.abort();
 		const owned = ownedChildren.get(runId);
 		if (owned) terminations.push(owned.terminate());
 	}
@@ -741,14 +748,26 @@ async function runSubagentProcess(
 		};
 
 		let messageQueue = Promise.resolve();
+		const lifetime = new AbortController();
 		const liveChild: LiveChild = {
+			abort: () => lifetime.abort(),
 			sendMessage(message: string, signal?: AbortSignal) {
+				signal = signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
 				const result = messageQueue.then(async () => {
 					if (signal?.aborted) throw new Error("Subagent message was aborted");
 					const followUp = isTerminalStatus(record.status);
-					const releaseTurn = followUp ? await gate.acquire(context.settings.maxConcurrency, signal) : undefined;
-					if (releaseTurn) continuationReleases.push(releaseTurn);
+					if (closing || diskCancelled()) throw new Error("Subagent is no longer running");
+					const previousStatus = record.status;
+					if (followUp) {
+						record.status = "queued";
+						record.activity = "waiting for a concurrency slot";
+						publish();
+					}
+					let releaseTurn: (() => void) | undefined;
 					try {
+						releaseTurn = followUp ? await gate.acquire(context.settings.maxConcurrency, signal) : undefined;
+						if (releaseTurn) continuationReleases.push(releaseTurn);
+						if (signal?.aborted || closing || diskCancelled()) throw new Error("Subagent message was aborted");
 						await send(
 							{
 								type: "prompt",
@@ -762,6 +781,11 @@ async function runSubagentProcess(
 							const index = continuationReleases.indexOf(releaseTurn);
 							if (index >= 0) continuationReleases.splice(index, 1);
 							releaseTurn();
+						}
+						if (followUp && record.status === "queued" && !diskCancelled()) {
+							record.status = previousStatus;
+							record.activity = previousStatus;
+							publish();
 						}
 						throw error;
 					}
@@ -858,6 +882,7 @@ async function runSubagentProcess(
 		launchedChild.stdin.on("error", (error) => failTransport(error));
 		launchedChild.on("close", (code) => {
 			closing = true;
+			lifetime.abort();
 			liveChildren.delete(record.runId);
 			for (const releaseTurn of continuationReleases.splice(0)) releaseTurn();
 			consumeStdout(stdoutDecoder.end());
