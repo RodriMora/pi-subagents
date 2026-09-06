@@ -87,7 +87,9 @@ export function loadSettings(options: {
 
 	const inheritedDepth = envNumber(env.PI_SUBAGENT_MAX_DEPTH, depth, "PI_SUBAGENT_MAX_DEPTH");
 	const flagDepth = options.depthFlag === undefined ? undefined : depth(Number(options.depthFlag), "--subagent-depth");
-	const configuredDepth = flagDepth ?? merged.maxDepth;
+	// An inherited value is already the tree's effective configuration (including
+	// a root flag override). Reloading defaults or config must not lower it again.
+	const configuredDepth = flagDepth ?? inheritedDepth ?? merged.maxDepth;
 	const envThinking = env.PI_SUBAGENT_DEFAULT_THINKING
 		? validateThinkingLevel(env.PI_SUBAGENT_DEFAULT_THINKING, "PI_SUBAGENT_DEFAULT_THINKING")
 		: undefined;
@@ -96,7 +98,7 @@ export function loadSettings(options: {
 		...merged,
 		defaultModel: env.PI_SUBAGENT_DEFAULT_MODEL || merged.defaultModel,
 		defaultThinking: envThinking ?? merged.defaultThinking,
-		// Descendants inherit the root's effective limit and can only tighten it.
+		// Only an explicit descendant flag can tighten the inherited effective limit.
 		maxDepth: inheritedDepth === undefined ? configuredDepth : Math.min(inheritedDepth, configuredDepth),
 		maxConcurrency: merged.maxConcurrency,
 	};

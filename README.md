@@ -140,7 +140,7 @@ All fields are optional. Defaults are `maxDepth: 2` and `maxConcurrency: 4`.
 - `maxDepth` — maximum recursive depth. The root is depth `0`; `maxDepth: 0` disables spawning. Descendants inherit the root limit and may only tighten it.
 - `maxConcurrency` — number of children allowed to run at once. Use `-1` for unlimited or a positive integer for a limit; extra children queue automatically.
 
-The `--subagent-depth N` Pi flag overrides configured depth for the tree. An inherited depth limit can never be raised by a descendant.
+The `--subagent-depth N` Pi flag overrides configured depth for the tree. Descendants preserve the inherited effective limit rather than reapplying defaults or configuration files. An explicit descendant `--subagent-depth N` may tighten that limit, but can never raise it.
 
 ## Footer controls
 
